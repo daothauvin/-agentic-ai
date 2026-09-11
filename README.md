@@ -1,4 +1,4 @@
-# EV Agent Linux — LangChain + LangGraph
+# EV Agent Linux
 
 Agent Linux autonome expérimental basé sur **LangChain**, **LangGraph** et **Ollama**.
 
@@ -6,21 +6,19 @@ Agent Linux autonome expérimental basé sur **LangChain**, **LangGraph** et **O
 
 ## 🎯 Objectif du projet
 
-Le but n'est pas seulement de faire un chatbot capable d'exécuter quelques commandes.
-
 L'objectif architectural est de construire une IA capable de **déterminer elle-même les outils dont elle a besoin, générer ces outils, installer les packages nécessaires, les utiliser, vérifier le résultat et apprendre de ses échecs via une boucle de résolution**.
 
-Cette capacité d'auto-outillage est **la direction cible du projet**. Dans la version actuelle, la génération de fichiers Python et l'installation dynamique de packages sont déjà représentées dans le graphe, mais peuvent encore échouer. Cela dépend notamment du modèle Ollama, de son support des sorties structurées, des permissions Linux, de la disponibilité des packages et de la qualité du code généré.
+Cette capacité d'auto-outillage est **la direction cible du projet**. 
 
-## Pourquoi LangChain + LangGraph ?
+## Choix Techniques 
 
-- **LangChain** fournit l'intégration avec le LLM Ollama, les messages et les sorties structurées.
-- **LangGraph** décrit explicitement le workflow sous forme de machine à états : planification, exécution, vérification et résolution d'erreurs.
-- Cette séparation rend l'agent plus facile à faire évoluer vers du streaming, du checkpointing, de la reprise après interruption et du human-in-the-loop. LangGraph est précisément conçu pour les workflows agentiques stateful et long-running. citeturn0search0turn0search3
+- **Les commandes Linux** sont utilisées pour utiliser et installer des packages. Linux à l'avantage d'avoir un grand nombre de packages libre d'accès. 
+- **LangChain** fournit l'intégration avec le LLM Ollama, les messages et les sorties structurées. Il s'agit de la reférence actuelle pour les LLMs.
+- **LangGraph** décrit explicitement le workflow sous forme de machine à états : planification, exécution, vérification et résolution d'erreurs. Cette séparation rend l'agent plus facile à faire évoluer, en proposant de nombreux outils pour du streaming, du checkpointing, de la reprise après interruption et du human-in-the-loop. 
 
 ## Architecture
 
-![Architecture de l'agent](agent_architecture.png)
+![Architecture de l'agent](graph.png)
 
 Le graphe est aussi enregistré directement dans `main.py` dans la constante `MERMAID_ARCHITECTURE`. À chaque lancement, une copie est écrite dans :
 
@@ -48,13 +46,12 @@ graph TD
 ### Flux détaillé
 
 1. **`inspect_environment`**
-   - détecte le répertoire de travail, l'OS, Python et le catalogue local des outils ;
    - prépare le contexte envoyé au modèle.
+   - détecte le répertoire de travail, l'OS, Python et le catalogue local des outils ;
 
 2. **`plan`**
-   - transforme la demande en tâches atomiques ;
+   - transforme la demande en tâches atomiques avec un LLM ;
    - représente les dépendances entre tâches ;
-   - ne génère volontairement pas de commandes shell à cette étape.
 
 3. **`select_task`**
    - choisit une tâche dont toutes les dépendances sont terminées ;
@@ -84,80 +81,6 @@ graph TD
    - génère un plan de résolution sous forme de nouvelles tâches ;
    - exécute ensuite ces tâches avant de retenter la tâche originale ;
    - limite la profondeur de résolution pour éviter les boucles infinies.
-
-## Structure du workspace
-
-```text
-AI_Workspace/
-└── projet_1/
-    ├── .agent/
-    │   ├── tools.json
-    │   ├── agent_architecture.mmd
-    │   └── tools/
-    │       ├── outil_genere_1.py
-    │       └── ...
-    └── ... fichiers créés par l'agent ...
-```
-
-Chaque IA possède son propre projet : `projet_1`, `projet_2`, etc.
-
-## Auto-outillage : objectif cible
-
-Le point important du projet est le passage d'un agent qui **consomme uniquement des outils codés à l'avance** à un agent qui peut **produire son propre outillage**.
-
-Le cycle visé est :
-
-```text
-Demande
-   ↓
-Planification
-   ↓
-"Il me manque un outil"
-   ↓
-Génération du code de l'outil
-   ↓
-Déclaration des dépendances
-   ↓
-Installation des packages
-   ↓
-Enregistrement de l'outil
-   ↓
-Utilisation
-   ↓
-Vérification
-   ↓
-Échec ? ───── oui ───→ Résolution → nouvelle tentative
-   │
-   non
-   ↓
-Résultat
-```
-
-### Ce qui fonctionne déjà dans l'architecture
-
-- génération d'une spécification d'outil par le LLM ;
-- écriture du code généré dans `.agent/tools/` ;
-- registre local `.agent/tools.json` ;
-- installation expérimentale de dépendances `pip`, `apt`, `npm` et `cargo` ;
-- boucle d'évaluation/résolution ;
-- tâches dépendantes ;
-- limitation de profondeur de résolution.
-
-### Ce qui reste à fiabiliser
-
-La génération de code par un petit modèle local n'est pas toujours correcte. Il faudra notamment ajouter :
-
-- validation/sandbox des outils générés ;
-- tests automatiques avant activation d'un outil ;
-- isolation Docker/VM ;
-- permissions minimales ;
-- rollback des installations ;
-- meilleur catalogue de capacités ;
-- découverte/recherche de packages ;
-- exécution directe des fonctions Python générées comme vrais tools LangChain ;
-- mémoire persistante/checkpointing ;
-- observabilité et traces LangSmith ;
-- éventuellement une étape de validation humaine avant une installation sensible.
 
 ## Installation
 
@@ -221,78 +144,62 @@ python3 main.py \
   --timeout 300 \
   "Analyse ce dossier et crée un script qui automatise le traitement demandé."
 ```
+### Ce qui fonctionne déjà dans l'architecture
 
-## Différence avec l'ancien agent
-
-L'ancien code était organisé autour de méthodes impératives : `plan()`, `execute_task()`, `evaluate()` et `execute_resolution_plan()`. Il gérait déjà une boucle de résolution et un catalogue d'installations. fileciteturn0file0L195-L212 fileciteturn0file0L609-L733
-
-La nouvelle version conserve cette intention mais transforme le workflow en graphe explicite : chaque étape devient un **node LangGraph**, et les transitions succès/échec deviennent des **conditional edges**. Cela permet de faire évoluer progressivement l'agent sans revenir à une grosse fonction récursive.
-
-L'ancien agent envoyait également des appels indépendants à Ollama sans historique. fileciteturn0file0L128-L156 La version LangGraph conserve par défaut une séparation claire entre les appels métier tout en plaçant l'état de l'exécution dans le `StateGraph`. Un checkpointer pourra être ajouté ultérieurement si l'on veut une reprise persistante entre interruptions. LangGraph fournit justement cette primitive de checkpointing. citeturn0search3
-
-## Sécurité
-
-Le projet assume actuellement un agent capable d'exécuter des commandes Linux. **C'est une capacité expérimentale et dangereuse si elle est utilisée sans isolation.**
-
-Pour une version sérieuse :
-
-1. exécuter l'agent dans une VM ou un container dédié ;
-2. limiter CPU/RAM/disque ;
-3. supprimer les privilèges root autant que possible ;
-4. contrôler les installations `apt` ;
-5. ajouter une approbation humaine avant les commandes sensibles ;
-6. tester le code généré avant de l'enregistrer comme outil actif ;
-7. ajouter un mécanisme de rollback.
+- installation expérimentale de dépendances `pip`, `apt`, `npm` et `cargo` ;
+- boucle d'évaluation/résolution ;
+- tâches dépendantes ;
+- limitation de profondeur de résolution.
 
 ## Roadmap
 
-### Phase 1 — actuelle
+### Phase 1 — architecture IA
 
 - [x] LangChain
 - [x] LangGraph
 - [x] Ollama
 - [x] planification
 - [x] exécution Linux
-- [x] évaluation
 - [x] résolution récursive transformée en boucle LangGraph
-- [x] génération expérimentale d'outils Python
 - [x] installation expérimentale de packages
 - [x] registre d'outils
 - [x] architecture Mermaid enregistrée dans le code
 
-### Phase 2 — fiabilisation
+### Phase 2 — outils et packages
 
-- [ ] vrais `@tool` LangChain dynamiques
-- [ ] tests automatiques des outils générés
-- [ ] sandbox par outil
 - [ ] découverte de packages et documentation
-- [ ] rollback
-- [ ] meilleure gestion des erreurs de dépendances
-
-### Phase 3 — agent réellement auto-évolutif
-
-- [ ] mémoire persistante des outils efficaces
-- [ ] sélection automatique d'un outil existant avant d'en générer un nouveau
-- [ ] amélioration automatique d'un outil qui échoue
-- [ ] benchmark de ses propres outils
-- [ ] versioning des outils
-- [ ] score de fiabilité par outil
+- [ ] stocker la documentation des packages
+- [ ] générer des outils codés en python
+- [ ] tests automatiques des outils générés
 - [ ] remplacement automatique d'un outil défectueux
 
-### Phase 4 — production
+### Phase 3 - sécurité
 
-- [ ] LangGraph checkpointing persistant
-- [ ] human-in-the-loop
-- [ ] observabilité LangSmith
-- [ ] sandbox/VM
-- [ ] politiques de permissions
-- [ ] gestion des secrets
-- [ ] tests de sécurité
+- [ ] ajouter des vérifications utilisateurs pour l'IA
+- [ ] vérifier la conformité des demandes utilisateurs au bon fonctionnement de l'ordinateur et de l'IA
+- [ ] empécher des attaques sur l'IA
+- [ ] isoler dans un environnement les packages installés par une IA
+
+### Phase 4 - évaluation
+- [ ] créer un bench de questions que le modèle doit passer
+- [ ] évaluer la réussite de ces fonctions par une IA
+
+### Phase 5 — gateways
+
+- [ ] proposer des modèles adaptés au différentes tâches
+- [ ] prévoir des modèles de secours
+
+### Phase 6 — Interface
+- [ ] Séparer serveur et utilisateur
+- [ ] Permettre des conversations longues durées
+
+### Phase 7 — README
+
+- [ ] Ajouter une architecture du code dans le README
+- [ ] Ajouter des tests automatiques de vérification de bon fonctionnement
 
 ## Références
 
 - Documentation LangGraph : https://langchain-ai.github.io/langgraph/
 - Documentation LangChain : https://python.langchain.com/
 - Intégration Ollama LangChain : https://python.langchain.com/docs/integrations/chat/ollama/
-
-LangGraph est particulièrement adapté ici parce qu'il est conçu pour orchestrer des agents stateful et des workflows longs avec possibilité de persistance, reprise et human-in-the-loop. citeturn0search0turn0search4
