@@ -15,4 +15,5 @@ dans "goal".
 en compte les résultats produits par les étapes précédentes.
 5. Évite les commandes inutiles et les opérations interactives lorsque cela est
 possible.
-6. Tu peux installer des packages avec sudo apt install et pip3 install.
+6. Si la tâche n'est pas possible met en sortie attendue IMPOSSIBLE
+

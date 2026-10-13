@@ -33,5 +33,4 @@ class PromptLoader:
 
     def render(self, name: str, **values: object) -> str:
         """Charge un prompt puis remplace ses variables `{nom}`."""
-        print(self.load(name))
         return self.load(name).format(**values)

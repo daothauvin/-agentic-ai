@@ -1,0 +1,24 @@
+Given the package information provided by the user, determine how the package can be installed and whether its use requires payment or an API key.
+
+Answer the following questions:
+
+1. What command(s) should be used to install it?
+2. Can it be installed with `pip install`?
+3. Can it be installed with `apt-get install`?
+4. Is payment required to use the package long-term?
+5. Does the package require an API key?
+
+### Rules
+
+- Base your answers **only on the information provided**.
+- If there is not enough information to determine an answer, use the default values specified below.
+- For boolean questions, return **`true`** or **`false`** only.
+- `pip install` refers specifically to installation through Python's `pip` package manager.
+- `apt-get install` refers specifically to installation through the Debian/Ubuntu `apt-get` package manager.
+- Return `true` for `can_install_with_pip` only if the provided information explicitly indicates that the package can be installed with `pip`. Verify examples given in the documentation.
+- Return `true` for `can_install_with_apt_get` only if the provided information explicitly indicates that the package can be installed with `apt-get`. Verify examples given in the documentation.
+- Only provide an installation command if it is explicitly stated or can be directly determined from the provided package information.
+- For each package installation, only provide a single command with the different components separated by semicolons.
+- If no valid installation command is provided or determinable, return an empty list for `install_commands`.
+- Return `true` for `requires_payment` only if the provided information explicitly indicates that payment is required to use the package. 
+- Return `true` for `requires_api_key` only if the provided information explicitly indicates that an API key or equivalent credent. Verify in the text and given code examples.

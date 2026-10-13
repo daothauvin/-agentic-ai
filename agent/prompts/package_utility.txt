@@ -1,0 +1,18 @@
+Given the package information and task description provided by the user, evaluate whether the package is relevant and usable for the task.
+
+Answer the following questions:
+
+1. Is the package useful for the task?
+2. Can the package be used with Python?
+3. Can the package be used through a CLI?
+4. Is payment required to use the package long-term?
+5. Does the package require an API key?
+
+Rules
+- Answer each question with true or false only.
+- If the provided information does not contain enough evidence to determine the answer, return false.
+- For "Can the package be used with Python?", return true if the package provides a Python library, Python API, Python bindings, or documented Python usage.
+- For "Can the package be used through a CLI?", return true only if the provided information explicitly indicates that the package can be used through a CLI.
+- For "Is payment required to use the package long-term?", return true only if continued/long-term use requires payment, a subscription, or paid usage. A package having an optional paid tier does not by itself imply true.
+- For "Does the package require an API key?", return true only if an API key or equivalent credential is required to use the package. Verify in the text and given code examples.
+- Do not include explanations, additional fields, or text outside these questions.
