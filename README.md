@@ -45,7 +45,7 @@ graph TD
     CONSTRUCT --> EXECUTE_CODE[execute_code_for_package]
     EXECUTE_CODE --> VERIFY_CODE[verify_code_package]
     VERIFY_CODE --> |réussi| REGISTER[register_tools]
-    VERIFY_CODE --> |rate| --> EXECUTE_CODE[execute_code_for_package]
+    VERIFY_CODE --> |rate| EXECUTE_CODE[execute_code_for_package]
     REGISTER --> PREPARE[search_tools]
     EXECUTE --> EVALUATE[evaluate]
     EVALUATE -->|success| RECORD[record_success]
