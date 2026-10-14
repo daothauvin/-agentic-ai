@@ -32,11 +32,25 @@ graph TD
     INSPECT --> PLAN[plan]
     PLAN --> SELECT[select_task]
     SELECT -->|tâche prête| PREPARE[prepare_task]
-    SELECT -->|plus de tâche| FINISH[finish]
-    PREPARE --> INSTALL[install_and_register_tools]
-    INSTALL --> EXECUTE[execute_commands]
+    SELECT -->|pas de tâche| FINISH[finish]
+    PREPARE -->|besoin d'outil| SEARCH[search_tools]
+    PREPARE -->|outil existe| EXECUTE[execute_commands]
+    SEARCH --> ANALYSIS[analysis_package]
+    ANALYSIS --> ELIGIBLE[record_eligible_package]
+    ELIGIBLE --> |True| INSTALL[install_package]
+    ELIGIBLE --> |False| ANALYSIS[analysis_package]
+
+    INSTALL --> |nécessite code|CONSTRUCT[construct_code_for_package]
+    INSTALL --> |échoue|ANALYSIS[analysis_package]
+    INSTALL --> |pas besoin code|REGISTER[register_tools]
+    CONSTRUCT --> EXECUTE_CODE[execute_code_for_package]
+    EXECUTE_CODE --> VERIFY_CODE[verify_code_package]
+    VERIFY_CODE --> |réussi| REGISTER[register_tools]
+    VERIFY_CODE --> |rate| --> EXECUTE_CODE[execute_code_for_package]
+    REGISTER --> PREPARE[search_tools]
     EXECUTE --> EVALUATE[evaluate]
-    EVALUATE -->|success| SELECT
+    EVALUATE -->|success| RECORD[record_success]
+    RECORD --> SELECT
     EVALUATE -->|failure| RESOLVE[resolve_failure]
     RESOLVE -->|resolvable| SELECT
     RESOLVE -->|not resolvable| FINISH
