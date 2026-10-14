@@ -39,7 +39,6 @@ graph TD
     ANALYSIS --> ELIGIBLE[record_eligible_package]
     ELIGIBLE --> |True| INSTALL[install_package]
     ELIGIBLE --> |False| ANALYSIS[analysis_package]
-
     INSTALL --> |nécessite code|CONSTRUCT[construct_code_for_package]
     INSTALL --> |échoue|ANALYSIS[analysis_package]
     INSTALL --> |pas besoin code|REGISTER[register_tools]
