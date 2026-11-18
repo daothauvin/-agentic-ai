@@ -13,13 +13,17 @@ from .models import (
     PackageInstall,
     PackageUse,
     IDs,
-    Package
+    Package,
+    PackageQueries,
+    PackageNames,
+    PackageRanking,
 )
 from .execution import run_command
-import os
-from  .create_pdf import download_pdf
 from urllib.parse import urljoin
-from pageindex import PageIndexClient
+from .rag import PackageRAG
+from .logger import get_logger, preview, timed
+
+logger = get_logger("toolsearch")
 
 class ToolSearchService:
     """
@@ -34,6 +38,11 @@ class ToolSearchService:
         self.prompts = agent.prompts
         self.config = agent.config
         self.tools = agent.tools
+        self.rag = PackageRAG(
+            ollama_url=self.config.ollama_url,
+            cache_dir=self.config.project_dir / ".rag",
+            multi_level=self.config.rag_multi_level,
+        )
 
     # ==============================================================
     # PUBLIC API
@@ -96,11 +105,13 @@ class ToolSearchService:
         pour accomplir la tâche.
         """
 
-        user_prompt = json.dumps(
-            state.get("current_task", {}),
-            ensure_ascii=False,
-            indent=2,
-        )
+        task = state.get("current_task", {}) or {}
+        if self.config.search_use_request and state.get("request"):
+            # 7. La demande initiale garde le contexte concret ("chien" et non "animal").
+            payload = {"demande_utilisateur": state["request"], "tache": task}
+        else:
+            payload = task
+        user_prompt = json.dumps(payload, ensure_ascii=False, indent=2)
 
         prompt = self.prompts.render(
             "tools_identifier",
@@ -118,8 +129,11 @@ class ToolSearchService:
         )
 
         tool = result.model_dump()
+        if self.config.search_use_request:
+            tool["request"] = state.get("request", "")
+            tool["task"] = task.get("title", "")
 
-        print("TOOL:", tool)
+        logger.info("Outil requis: %s", tool)
         return tool
 
     # ==============================================================
@@ -128,130 +142,257 @@ class ToolSearchService:
 
     def search_packages(self, tool_spec):
         """
-        Recherche des repositories correspondant au besoin.
+        Retourne les packages PyPI candidats, classés du plus au moins pertinent.
 
-        Un résultat peut être :
-        - directement un repository GitHub
-        - un topic GitHub
-        - éventuellement une page de recherche GitHub
-
-        Dans tous les cas, cette méthode retourne uniquement
-        des repositories exploitables.
+        Étapes (chacune activable dans AgentConfig) :
+            1. requêtes courtes multiples (sinon une requête longue) ;
+            2. noms proposés par le LLM et vérifiés sur PyPI ;
+            5. normalisation des URLs + dédoublonnage ;
+            4. filtre sur les métadonnées PyPI ;
+            3. classement LLM sur nom + résumé.
         """
 
-        search_query = self.build_package_search_query(tool_spec)
-        html = self.search_web(search_query)
-        return self.parse_search_results(html)
-    
+        queries = self.build_package_search_queries(tool_spec)
+        results, hits = self.run_search_queries(queries)
 
-    def is_repository_path(self, path: str) -> bool:
-        """
-        Vérifie qu'un path ressemble à :
+        if self.config.search_name_guess:
+            with timed("Noms de packages proposés par le LLM", logger):
+                results = self.guess_package_names(tool_spec) + results
 
-            /owner/repository
+        if self.config.search_normalize:
+            results = self.normalize_and_sort(results, hits)
 
-        et non :
+        if self.config.search_metadata_filter:
+            with timed("Filtre métadonnées PyPI", logger):
+                results = self.filter_by_metadata(results)
 
-            /topics/...
-            /login
-            /settings/...
-            etc.
-        """
+        if self.config.search_prerank and results:
+            with timed("Classement LLM des candidats", logger):
+                results = self.rank_candidates(results, tool_spec)
 
-        match = re.match(
-            r"^/([^/]+)/([^/]+)$",
-            path,
-        )
+        logger.info("%d packages candidats: %s", len(results), [p.url for p in results])
+        return results
 
-        if not match:
-            return False
+    def run_search_queries(self, queries: list[str]) -> tuple[list[Package], dict[str, int]]:
+        """Lance chaque requête sur SearXNG et fusionne les résultats en alternance.
 
-        owner, repository = match.groups()
-
-        excluded = {
-            "topics",
-            "search",
-            "orgs",
-            "organizations",
-            "marketplace",
-            "features",
-            "login",
-            "signup",
-            "about",
-            "pricing",
-        }
-
-        return (
-            owner not in excluded
-            and not repository.startswith("?")
-        )
-
-    def deduplicate_repositories(
-        self,
-        repositories: list[str],
-    ) -> list[str]:
-        """
-        Supprime les repositories en double
-        tout en conservant l'ordre.
+        Retourne aussi, pour chaque package, le nombre de requêtes qui l'ont trouvé.
         """
 
-        seen = set()
-        unique = []
+        per_query: list[list[Package]] = []
+        hits: dict[str, int] = {}
+        for query in queries:
+            with timed(f"Recherche web SearXNG '{query}'", logger):
+                try:
+                    found = self.parse_search_results(self.search_web(query))
+                except requests.RequestException as error:
+                    logger.warning("Recherche SearXNG échouée (%s): %s", query, error)
+                    found = []
+            logger.info("%d résultats pour '%s'", len(found), query)
+            # Un hit par requête : un doublon dans la même page ne compte pas.
+            for key in {pypi_name_from_url(p.url) or p.url for p in found}:
+                hits[key] = hits.get(key, 0) + 1
+            per_query.append(found)
 
-        for repository in repositories:
-            repository = self.normalize_repository_url(
-                repository
+        # Fusion en alternance (1er de chaque requête, puis 2e...) : aucune requête n'écrase les autres.
+        results = [
+            ranked[i] for i in range(max((len(r) for r in per_query), default=0))
+            for ranked in per_query if i < len(ranked)
+        ]
+        return results, hits
+
+    def normalize_and_sort(self, packages: list[Package], hits: dict[str, int]) -> list[Package]:
+        """5. Normalise et dédoublonne ; les packages trouvés par plusieurs requêtes passent devant."""
+
+        results = self.normalize_packages(packages)
+        results.sort(key=lambda p: -hits.get(pypi_name_from_url(p.url), 0))  # tri stable
+        return results
+
+    def build_package_search_queries(self, tool_spec) -> list[str]:
+        """Requêtes de recherche : 3 requêtes courtes (1.) ou une requête longue."""
+
+        user_prompt = json.dumps(tool_spec, ensure_ascii=False, indent=2)
+
+        if not self.config.search_multi_query:
+            result = self.llm.structured(
+                PackageResearch,
+                self.prompts.render("package_searcher"),
+                user_prompt,
             )
-
-            key = repository.lower()
-
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(repository)
-        return unique
-    
-    def build_package_search_query(self, tool_spec):
-        """
-        Utilise le LLM pour transformer la description de l'outil
-        en requête de recherche de packages.
-        """
-
-        prompt = self.prompts.render(
-            "package_searcher"
-        )
-
-        user_prompt = json.dumps(
-            tool_spec,
-            ensure_ascii=False,
-            indent=2,
-        )
+            logger.info("Requête de recherche: %s", result.internet_research)
+            return [result.internet_research]
 
         result = self.llm.structured(
-            PackageResearch,
-            prompt,
+            PackageQueries,
+            self.prompts.render("package_queries"),
             user_prompt,
         )
+        queries = []
+        for query in result.queries:
+            # Garde-fou : le petit modèle écrit parfois une phrase entière.
+            query = " ".join(query.replace('"', " ").split()[:8])
+            if query and query.lower() not in (q.lower() for q in queries):
+                queries.append(query)
+        queries = queries[:3]
+        logger.info("Requêtes de recherche: %s", queries)
+        return queries
 
-        print(
-            "INTERNET PROMPT:",
-            result.internet_research,
+    def guess_package_names(self, tool_spec) -> list[Package]:
+        """2. Le LLM propose des noms ; seuls ceux qui existent sur PyPI sont gardés."""
+
+        result = self.llm.structured(
+            PackageNames,
+            self.prompts.render("package_names"),
+            json.dumps(tool_spec, ensure_ascii=False, indent=2),
         )
+        names = [n.strip().split("[")[0].split("=")[0] for n in result.names if n.strip()]
+        logger.info("Noms proposés par le LLM: %s", names)
 
-        return result.internet_research
+        packages = []
+        for name in names[:5]:
+            data = self.fetch_pypi_json_by_name(name)
+            if data is None:
+                logger.info("Nom proposé inexistant sur PyPI: %s", name)
+                continue
+            info = data.get("info", {})
+            packages.append(Package(
+                title=info.get("name") or name,
+                url=f"https://pypi.org/project/{info.get('name') or name}/",
+                content=info.get("summary") or "",
+                package_use=None, package_install=None, usage_context=None, tree=None,
+            ))
+        return packages
+
+    def normalize_packages(self, packages: list[Package]) -> list[Package]:
+        """5. Ramène chaque URL à https://pypi.org/project/<nom>/ et retire les doublons."""
+
+        seen, unique = set(), []
+        for package in packages:
+            name = pypi_name_from_url(package.url)
+            if name is None:
+                logger.debug("URL ignorée (pas un projet PyPI): %s", package.url)
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            unique.append(package.model_copy(update={"url": f"https://pypi.org/project/{name}/"}))
+        return unique
+
+    def filter_by_metadata(self, packages: list[Package]) -> list[Package]:
+        """4. Rejette, sans LLM, les packages inactifs, incompatibles ou sans fichier."""
+
+        import sys
+        from concurrent.futures import ThreadPoolExecutor
+        from datetime import datetime, timezone
+
+        def check(package: Package):
+            data = self.fetch_pypi_json_by_name(pypi_name_from_url(package.url) or "")
+            if data is None:
+                return package, "introuvable sur PyPI", None
+            info = data.get("info", {}) or {}
+            urls = data.get("urls") or []
+            if not urls:
+                return package, "aucun fichier pour la dernière version", None
+            classifiers = info.get("classifiers") or []
+            if any("Development Status :: 7 - Inactive" in c for c in classifiers):
+                return package, "marqué Inactive", None
+            upload = max((u.get("upload_time_iso_8601") or "" for u in urls), default="")
+            if upload:
+                age = datetime.now(timezone.utc) - datetime.fromisoformat(upload.replace("Z", "+00:00"))
+                if age.days > 3 * 365:
+                    return package, f"dernière release il y a {age.days // 365} ans", None
+            if not python_version_ok(info.get("requires_python"), sys.version_info[:2]):
+                return package, f"requires_python {info.get('requires_python')}", None
+            downloads = self.monthly_downloads(info.get("name") or "")
+            if downloads is not None and downloads < self.config.search_min_monthly_downloads:
+                # Protège aussi contre les noms inventés/squattés (slopsquatting).
+                return package, f"{downloads} téléchargements/mois", None
+            summary = info.get("summary") or package.content
+            return package.model_copy(update={"content": summary}), None, info.get("name")
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            checked = list(pool.map(check, packages))
+
+        kept = []
+        for package, reason, _ in checked:
+            if reason:
+                logger.info("Package filtré (%s): %s", reason, package.url)
+            else:
+                kept.append(package)
+        return kept
+
+    def rank_candidates(self, packages: list[Package], tool_spec) -> list[Package]:
+        """3. Un seul appel LLM classe les candidats sur leur nom et leur résumé."""
+
+        listing = "\n".join(
+            f"{i}. {pypi_name_from_url(p.url) or p.title} — {preview(p.content, 200)}"
+            for i, p in enumerate(packages, start=1)
+        )
+        task = {k: tool_spec.get(k) for k in ("request", "task", "description", "input", "output") if tool_spec.get(k)}
+        result = self.llm.structured(
+            PackageRanking,
+            self.prompts.render("package_ranking"),
+            f"TASK:\n{json.dumps(task, ensure_ascii=False, indent=2)}\n\nCANDIDATES:\n{listing}",
+        )
+        order = []
+        for number in result.ranking:
+            if 1 <= number <= len(packages) and number - 1 not in order:
+                order.append(number - 1)
+        logger.info("Classement LLM: %s", [pypi_name_from_url(packages[i].url) for i in order])
+        if not order:
+            # Le LLM n'a rien retenu : on garde l'ordre d'origine plutôt que de tout perdre.
+            return packages
+        return [packages[i] for i in order]
+
+    def monthly_downloads(self, name: str) -> int | None:
+        """Téléchargements du dernier mois (pypistats.org), None si indisponible."""
+
+        try:
+            response = requests.get(
+                f"https://pypistats.org/api/packages/{name.lower()}/recent",
+                headers={"User-Agent": "agent-langchain/1.0"},
+                timeout=15,
+            )
+            if response.status_code != 200:
+                return 0 if response.status_code == 404 else None
+            return int(response.json()["data"]["last_month"])
+        except (requests.RequestException, KeyError, ValueError):
+            return None
+
+    def fetch_pypi_json_by_name(self, name: str) -> dict | None:
+        """JSON PyPI d'un package (mis en cache), None si le package n'existe pas."""
+
+        if not name:
+            return None
+        cache = self.__dict__.setdefault("_pypi_cache", {})
+        key = name.lower()
+        if key not in cache:
+            try:
+                response = requests.get(
+                    f"https://pypi.org/pypi/{name}/json",
+                    headers={"User-Agent": "agent-langchain/1.0"},
+                    timeout=30,
+                )
+                cache[key] = response.json() if response.status_code == 200 else None
+            except requests.RequestException as error:
+                logger.warning("PyPI injoignable pour %s: %s", name, error)
+                return None
+        return cache[key]
+
+    def build_package_search_query(self, tool_spec):
+        """Compatibilité : première requête de recherche."""
+
+        return self.build_package_search_queries(tool_spec)[0]
 
     def search_web(self, query: str):
-        """
-        Effectue la recherche web.
+        """Effectue la recherche web via SearXNG (limitée à pypi.org)."""
 
-        TODO:
-        - éventuellement remplacer localhost:8080 par une abstraction
-        """
         response = requests.get(
-            "http://localhost:8080/search",
+            self.config.searxng_url,
             params={
                 "q": query + " site:pypi.org",
                 "language": "auto",
+                **({"engines": self.config.searxng_engines} if self.config.searxng_engines else {}),
             },
             timeout=300,
         )
@@ -305,41 +446,36 @@ class ToolSearchService:
         au besoin.
         """
 
-        print("--> TEST REPO:", package.url)
+        logger.info("Analyse du package: %s", package.url)
 
-        pdf_path = self.create_pdf(
-            package=package,
-        )
+        with timed(f"[{package.title}] Métadonnées PyPI", logger):
+            pypi_json = self.fetch_pypi_json(package)
 
-        tree = self.index_pdf(
-            pdf_path
-        )
+        with timed(f"[{package.title}] Indexation FAISS (bge-m3)", logger):
+            index = self.rag.index_package(pypi_json)
 
-        installation_context = self.extract_installation_context(
-            tree
-        )
+        with timed(f"[{package.title}] Retrieval installation", logger):
+            installation_context = self.extract_installation_context(index)
+        logger.debug("Contexte installation:\n%s", installation_context)
 
-        usage_context = self.extract_usage_context(
-            tree,
-            tool_spec,
-        )
-        print(usage_context)
-        installation_info = self.analyze_installation(
-            installation_context
-        )
+        with timed(f"[{package.title}] Retrieval usage", logger):
+            usage_context = self.extract_usage_context(index, tool_spec)
+        logger.debug("Contexte usage:\n%s", usage_context)
 
-        usage_info = self.analyze_usage(
-            usage_context,
-            tool_spec,
-        )
-        print("INSTALLATION INFO:", installation_info)
-        print("USAGE INFO:", usage_info)
+        with timed(f"[{package.title}] Analyse installation (LLM)", logger):
+            installation_info = self.analyze_installation(installation_context)
+
+        with timed(f"[{package.title}] Analyse usage (LLM)", logger):
+            usage_info = self.analyze_usage(usage_context, tool_spec)
+
+        logger.info("INSTALLATION INFO: %s", installation_info)
+        logger.info("USAGE INFO: %s", usage_info)
         
         return Package(
             title = package.title,
             url = package.url,
             content = package.content,
-            tree = tree,
+            tree = None,
             package_use = usage_info,
             package_install = installation_info,
             usage_context = usage_context
@@ -349,200 +485,55 @@ class ToolSearchService:
     
 
     # ==============================================================
-    # 3.2 README -> PDF
+    # 3.2 PyPI metadata
     # ==============================================================
 
-    def create_pdf(self,package):
-        """
-        Transforme le README Markdown en PDF.
+    def fetch_pypi_json(self, package):
+        """Récupère les métadonnées JSON PyPI (README inclus) du package."""
 
-        TODO:
-        - gérer les images
-        - gérer les liens
-        - choisir un nom de fichier unique
-        - éviter les collisions entre repositories
-        """
-        url = package.url
+        name = pypi_name_from_url(package.url)
+        if name and self.fetch_pypi_json_by_name(name) is not None:
+            return self.fetch_pypi_json_by_name(name)
         response = requests.get(
-            urljoin(url.replace("project", "pypi"),"json"),
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; PyPI-to-PDF/1.0)"
-            },
+            urljoin(package.url.replace("project", "pypi"), "json"),
+            headers={"User-Agent": "agent-langchain/1.0"},
             timeout=30,
         )
         response.raise_for_status()
-
-        pdf_path = (
-            self.config.project_dir
-            / "README.pdf"
-        )
-
-        download_pdf(response.json(), pdf_path)
-        return pdf_path
-
+        return response.json()
 
     # ==============================================================
-    # 3.3 PageIndex
+    # 3.3 Retrieval sémantique (bge-m3 + FAISS)
     # ==============================================================
 
-    def create_pageindex_client(self):
-        """
-        Crée le client PageIndex.
+    def extract_installation_context(self, index):
+        """Passages de la doc concernant l'installation."""
 
-        Cette méthode permet d'isoler la configuration
-        de PageIndex du reste de la logique.
-        """
-
-        backend = {
-            "api_key": "ollama",
-            "base_url": "http://localhost:11434/v1",
-        }
-
-        return PageIndexClient(
-            index={
-                "model": "openai/qwen2.5:3b",
-                "storage_path": "./.pageindex",
-                "backend": backend,
-            }
+        chunks = self.rag.retrieve(
+            index,
+            # Une seule requête, top-k court (AgentConfig.rag_install_k) : un
+            # contexte trop long fait perdre la commande au petit LLM.
+            ["How to install the package? pip install command"],
+            k=self.config.rag_install_k,
+            purpose="installation",
         )
+        return self.rag.to_context(chunks)
 
-    def index_pdf(self, pdf_path):
-        """
-        Soumet le PDF à PageIndex et récupère son arbre.
-        """
+    def extract_usage_context(self, index, tool_spec):
+        """Passages expliquant comment utiliser le package pour la tâche."""
 
-        client = self.create_pageindex_client()
-
-        print("WAITING FOR PDF SUBMISSION")
-
-        result = client.submit_document(
-            pdf_path,
-            wait=True,
-        )
-
-        tree_result = client.get_tree(
-            result["doc_id"]
-        ).get("result", [])
-
-        print(
-            f"FINISHED WITH {count(tree_result)} NODES"
-        )
-
-        return tree_result
-
-    # ==============================================================
-    # 3.4 Relevant sections
-    # ==============================================================
-
-    def extract_installation_context(self, tree):
-        """
-        Cherche dans l'arbre les sections concernant l'installation.
-        """
-
-        result = self.find_relevant_nodes(
-            tree=tree,
-            questions=[
-                "How to install the package?",
+        chunks = self.rag.retrieve(
+            index,
+            [
+                f"How to use the package to: {tool_spec.get('description', '')}",
+                f"Usage example: input {tool_spec.get('input', '')}, "
+                f"output {tool_spec.get('output', '')}",
+                "Quickstart usage example code / command line",
             ],
+            k=self.config.rag_usage_k,
+            purpose="usage",
         )
-        
-
-        return self.nodes_to_context(
-            tree,
-            [x for sl in result for x in sl.node_list],
-        )
-
-    def extract_usage_context(
-        self,
-        tree,
-        tool_spec,
-    ):
-        """
-        Cherche les sections expliquant comment utiliser
-        le package pour la tâche demandée.
-        """
-
-        tool_description = json.dumps(
-            tool_spec,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-        result = self.find_relevant_nodes(
-            tree=tree,
-            questions=[
-                (
-                    "How to use the package for "
-                    f"the following task? "
-                    f"{tool_description}"
-                )
-            
-            ],
-        )
-        
-
-        return self.nodes_to_context(
-                    tree,
-                    [x for sl in result for x in sl.node_list],
-                )
-
-    def find_relevant_nodes(
-        self,
-        tree,
-        questions,
-    ):
-        """
-        Utilise le LLM pour identifier les nodes pertinentes
-        dans l'arbre PageIndex.
-        """
-
-        prompt = f"""
-You are given a query and a document's tree structure
-(like a Table of Contents).
-
-Your task: identify which node IDs (3 maximum) most likely contain
-the answer to the query. 
-
-Document Tree:
-
-{json.dumps(
-    compress(tree),
-    indent=2,
-)}
-"""
-
-        return self.llm.structured_batch(
-            IDs,
-            prompt,
-            questions,
-        )
-
-    def nodes_to_context(
-        self,
-        tree,
-        node_ids,
-    ):
-        """
-        Transforme des IDs de nodes en contexte textuel.
-        """
-
-        nodes = find_nodes_by_ids(
-            tree,
-            node_ids,
-        )
-
-        context_parts = []
-
-        for node in nodes:
-
-            context_parts.append(
-                f"[Section: '{node['title']}']\n"
-                f"{node.get('text', 'Content not available')}"
-            )
-
-        return "\n\n---\n\n".join(
-            context_parts
-        )
+        return self.rag.to_context(chunks)
 
     # ==============================================================
     # 4. PACKAGE INSTALLATION ANALYSIS
@@ -650,8 +641,10 @@ Document Tree:
         """
 
         installation = analysis.package_install
-        print(installation)
-        input()
+        logger.info("Commandes d'installation: %s", installation.install_commands)
+        if not installation.install_commands:
+            logger.warning("Aucune commande d'installation fournie pour %s", analysis.url)
+
         for command in installation.install_commands:
 
             result = run_command(
@@ -662,7 +655,7 @@ Document Tree:
 
             if result.get("ok"):
                 return True
-            print(result)
+            logger.warning("Installation échouée: %s -> %s", command, preview(result["stderr"]))
 
         return False
 
@@ -746,38 +739,46 @@ Document Tree:
         pass
 
 
-def compress(nodes):
-    out = []
-    for n in nodes:
-                entry = {"node_id": 
-                         n["node_id"], 
-                         "title": n["title"], 
-                         "page": n.get("page_index", "?"),
-                         "summary": n.get("text","")[:200]
-                         }
-                if n.get("nodes"):
-                    entry["children"] = compress(n["nodes"])
-                out.append(entry)
-    return out
-
-def count(nodes):
-    res = 0
-    for n in nodes:
-                res += 1
-                if n.get("nodes"):
-                    res = res + count(n["nodes"])
-                
-    return res
 
 
-def find_nodes_by_ids(tree: list, target_ids:list) -> list:
+_PYPI_PROJECT = re.compile(r"^https?://(?:www\.)?pypi\.org/project/([^/?#]+)", re.I)
+
+
+def pypi_name_from_url(url: str) -> str | None:
+    """Nom normalisé (PEP 503) d'un projet PyPI depuis son URL, None sinon.
+
+    https://pypi.org/project/InstaPy/0.3.4/ -> "instapy"
     """
-        Recursively walk the tree and collect nodes matching target_ids.
-    """
-    found = []
-    for node in tree:
-        if node["node_id"] in target_ids:
-            found.append(node)
-        if node.get("nodes"):
-            found.extend(find_nodes_by_ids(node["nodes"], target_ids))
-    return found
+
+    match = _PYPI_PROJECT.match(url or "")
+    if not match:
+        return None
+    return re.sub(r"[-_.]+", "-", match.group(1)).lower()
+
+
+def python_version_ok(requires_python: str | None, version: tuple[int, int]) -> bool:
+    """Vérifie grossièrement un specifier requires_python (>=, <, <=, ==, !=, ~=)."""
+
+    if not requires_python:
+        return True
+    current = version
+    for spec in requires_python.split(","):
+        spec = spec.strip()
+        match = re.match(r"^(>=|<=|==|!=|~=|>|<)\s*(\d+)(?:\.(\d+|\*))?", spec)
+        if not match:
+            continue
+        op, major, minor = match.group(1), int(match.group(2)), match.group(3)
+        if minor == "*":
+            if op == "==" and current[0] != major:
+                return False
+            continue
+        target = (major, int(minor or 0))
+        ok = {
+            ">=": current >= target, ">": current > target,
+            "<=": current <= target, "<": current < target,
+            "==": current == target, "!=": current != target,
+            "~=": current >= target and current[0] == target[0],
+        }[op]
+        if not ok:
+            return False
+    return True

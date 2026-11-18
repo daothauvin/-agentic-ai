@@ -2,9 +2,13 @@
 
 import shlex
 import subprocess
-import sys
+import time
 from pathlib import Path
 from typing import Any
+
+from .logger import get_logger, preview
+
+logger = get_logger("shell")
 
 
 def compact(text: str, limit: int = 16000) -> str:
@@ -52,7 +56,8 @@ def parse_install_command(command: str) -> tuple[str, list[str]] | None:
 def run_command(command: str, cwd: Path, timeout: int) -> dict[str, Any]:
     """Exécute une commande Bash et retourne stdout, stderr et le code retour."""
 
-    print(f"\n$ {command}")
+    logger.info("$ %s", command)
+    start = time.perf_counter()
     installation = parse_install_command(command)
 
     try:
@@ -80,7 +85,12 @@ def run_command(command: str, cwd: Path, timeout: int) -> dict[str, Any]:
             "command": command,
             "ok": False,
             "returncode": -2,
-            "stdout": compact(exc.stdout or ""),
+            # Même avec text=True, TimeoutExpired.stdout peut être en bytes.
+            "stdout": compact(
+                exc.stdout.decode(errors="replace")
+                if isinstance(exc.stdout, bytes)
+                else exc.stdout or ""
+            ),
             "stderr": f"Timeout après {timeout}s.",
         }
 
@@ -97,10 +107,19 @@ def run_command(command: str, cwd: Path, timeout: int) -> dict[str, Any]:
         result["package_manager"] = installation[0]
         result["package"] = installation[1]
 
+    result["duration_s"] = round(time.perf_counter() - start, 2)
+    logger.info(
+        "  -> code=%s en %.1fs | stdout: %s | stderr: %s",
+        result["returncode"],
+        result["duration_s"],
+        preview(result["stdout"], 150),
+        preview(result["stderr"], 150),
+    )
+
     if result["stdout"]:
-        print(result["stdout"])
+        logger.debug("stdout complet:\n%s", result["stdout"])
 
     if result["stderr"]:
-        print(result["stderr"], file=sys.stderr)
+        logger.debug("stderr complet:\n%s", result["stderr"])
 
     return result
