@@ -1,0 +1,42 @@
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Environnements virtuels ---
+.venv/
+venv/
+.env_agentic/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Notes personnelles ---
+AMELIORATIONS.md
+
+# --- Fichiers temporaires / caches de l'agent ---
+.checkpoints/
+.phoenix/
+.pageindex/
+.rag/
+projet_*/
+bench/.rag_cache/
+bench/results/
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Divers ---
+*:Zone.Identifier
+.DS_Store
+.vscode/
+.idea/
+
+# --- Instructions locales pour agents IA ---
+AGENTS.md
