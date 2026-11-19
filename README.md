@@ -93,7 +93,7 @@ Les états sont sauvegardés après chaque nœud par un checkpointer SQLite (`pr
 
 - **PyPI** : Python est déjà présent, `pip` est le gestionnaire le plus simple à automatiser, et l'API JSON de PyPI fournit le README, les versions et la compatibilité Python sans scraping.
 - **SearXNG** (moteur de recherche local, via Docker) : sans clé d'API, interrogeable en HTTP ; `site:pypi.org` restreint les résultats aux projets.
-- **Yahoo** : parmi les moteurs disponibles dans SearXNG, c'est le seul mesuré qui respecte `site:` sans se faire bloquer (voir la section SearXNG).
+- **Plusieurs moteurs combinés** (Startpage, Presearch, Yandex, Seznam, Marginalia) : ils respectent `site:` et se relaient quand l'un est suspendu (voir la section SearXNG).
 
 Chaque étape du pipeline a été **gardée parce qu'elle a été mesurée** (voir les tableaux du bench) :
 
@@ -263,9 +263,9 @@ La recherche de packages interroge `http://localhost:8080/search` et **échoue s
 docker start searxng
 ```
 
-Plusieurs moteurs sont disponibles dans l'instance SearXNG : **Yahoo**, DuckDuckGo, Brave, Google CSE, Qwant, Bing (et le moteur `pypi`). Le choix se fait avec `searxng_engines` dans `AgentConfig` (noms séparés par des virgules, `""` = moteurs par défaut de l'instance). **Yahoo est le moteur par défaut** (`searxng_engines="yahoo"`) : c'est le seul qui respecte `site:pypi.org` sans se faire bloquer. Bing ignore `site:`, et le moteur `pypi` renvoie 0 résultat (recherche PyPI protégée par un challenge JavaScript).
+Plusieurs moteurs sont disponibles dans l'instance SearXNG. Le choix se fait avec `searxng_engines` dans `AgentConfig` (noms séparés par des virgules, `""` = moteurs par défaut de l'instance). **Défaut : `startpage,presearch,yandex,seznam,marginalia`** (mesuré le 18/11/2026) : ces moteurs respectent `site:pypi.org`, et comme chacun finit par être suspendu (`too many requests`), les combiner garantit qu'au moins deux répondent (11 à 16 résultats PyPI par requête sur 4 requêtes consécutives). Yahoo, ancien défaut, renvoie une `parsing error` depuis SearXNG 2026.9 ; Bing ignore `site:` ; le moteur `pypi` renvoie 0 résultat (challenge JavaScript).
 
-⚠️ **Les moteurs de SearXNG se font bloquer** après quelques dizaines de requêtes rapprochées (CAPTCHA DuckDuckGo pendant 1 h, `too many requests` pour Brave et Google CSE, `access denied` pour Qwant). SearXNG renvoie alors 0 résultat sans erreur. Yahoo résiste mieux mais n'est pas à l'abri : espacer les runs (`--pause` dans les benchs). Pour vérifier :
+⚠️ **Les moteurs de SearXNG se font bloquer** après quelques requêtes rapprochées (CAPTCHA DuckDuckGo, `too many requests` pour Brave, Startpage, Presearch, `HTTP error 403` pour Google, `access denied` pour Qwant). SearXNG renvoie alors 0 résultat **sans erreur HTTP** ; l'agent lit le tableau « Messages from the search engines » de la page et logue un `WARNING SearXNG: moteur(s) en erreur pour '<requête>': {moteur: erreur}`. Pour vérifier à la main :
 
 ```bash
 curl -s 'http://localhost:8080/search?q=qrcode+site:pypi.org' | python3 -c "import sys; h=sys.stdin.read(); print(h.count('<article class=\"result'), 'résultats |', [e for e in ('CAPTCHA','too many requests','access denied','timeout') if e in h] or 'ok')"
@@ -402,6 +402,12 @@ La recherche SearXNG seule classe mal (MRR 0,43) : ce sont les noms proposés pa
 - **Fichier** : niveau `DEBUG` complet (prompts, README extraits, code généré, stdout/stderr complets) dans `projet_<id>/.agent/logs/run_<date>.log`, avec un lien `latest.log` vers le dernier run.
 - Chaque ligne est écrite sur disque immédiatement : **même si l'exécution est tuée (timeout, `kill -9`, crash), le log contient tout jusqu'à la dernière étape commencée.**
 - Chaque nœud du graphe, chaque appel LLM et chaque sous-étape d'analyse de package logue son début (`▶`), sa fin avec sa durée (`✔`) ou son échec (`✖`).
+- Signaux à chercher en cas d'échec (`grep -E "WARNING|ERROR" latest.log`) :
+  - `SearXNG: moteur(s) en erreur` : moteurs bloqués ou cassés (la requête renvoie alors peu ou pas de résultats) ;
+  - `Package filtré (...)` : raison du rejet par le filtre métadonnées (âge de la release, téléchargements/mois) ;
+  - `Classement LLM vide` : le LLM n'a retenu aucun candidat, l'ordre d'origine est conservé (packages populaires mais souvent hors sujet) ; la liste soumise est en `DEBUG` ;
+  - `Test de l'outil sans sortie` : l'outil généré s'exécute sans rien afficher ;
+  - `Vérification de l'outil ... plus aucun package candidat` : fin propre de la boucle génération/vérification.
 - **Fichier RAG** : `projet_<id>/.agent/logs/rag_<date>.log` (lien `latest_rag.log`) ne contient que les logs `agent.rag`, en `DEBUG` :
   - taille du document (métadonnées / README), avec un avertissement si le README fait moins de 200 caractères ;
   - chunking : nombre de chunks, tailles min/moy/médiane/max, puis chaque chunk (`#id [section] taille : aperçu`), signalé `⚠ très court` (< 50 car.) ou `⚠ > max_chars` ;

@@ -328,6 +328,7 @@ class ToolSearchService:
             f"{i}. {pypi_name_from_url(p.url) or p.title} — {preview(p.content, 200)}"
             for i, p in enumerate(packages, start=1)
         )
+        logger.debug("Candidats soumis au classement LLM:\n%s", listing)
         task = {k: tool_spec.get(k) for k in ("request", "task", "description", "input", "output") if tool_spec.get(k)}
         result = self.llm.structured(
             PackageRanking,
@@ -341,6 +342,11 @@ class ToolSearchService:
         logger.info("Classement LLM: %s", [pypi_name_from_url(packages[i].url) for i in order])
         if not order:
             # Le LLM n'a rien retenu : on garde l'ordre d'origine plutôt que de tout perdre.
+            logger.warning(
+                "Classement LLM vide (réponse brute: %s) : ordre d'origine conservé, "
+                "les candidats analysés risquent d'être hors sujet",
+                result.ranking,
+            )
             return packages
         return [packages[i] for i in order]
 
@@ -398,8 +404,36 @@ class ToolSearchService:
         )
 
         response.raise_for_status()
+        logger.debug("SearXNG GET %s -> HTTP %s (%d car.)",
+                     response.url, response.status_code, len(response.text))
+        self.log_engine_errors(response.text, query)
 
         return response.text
+
+    @staticmethod
+    def log_engine_errors(html: str, query: str) -> dict[str, str]:
+        """Logue les moteurs SearXNG en erreur (captcha, 403, parsing...).
+
+        Sans ce log, un moteur cassé se traduit seulement par « 0 résultats ».
+
+        Args:
+            html: Page de résultats SearXNG.
+            query: Requête envoyée (pour le contexte du log).
+
+        Returns:
+            Dictionnaire moteur -> message d'erreur.
+        """
+
+        soup = BeautifulSoup(html, "html.parser")
+        errors = {}
+        for row in soup.select("#engines_msg-table tr"):
+            name = row.select_one(".engine-name")
+            error = row.select_one(".response-error")
+            if name and error:
+                errors[name.get_text(strip=True)] = error.get_text(strip=True)
+        if errors:
+            logger.warning("SearXNG: moteur(s) en erreur pour '%s': %s", query, errors)
+        return errors
 
     def parse_search_results(self, html: str):
         """

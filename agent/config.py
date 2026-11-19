@@ -35,8 +35,10 @@ class AgentConfig:
     prompts_dir: Path = Path("agent/prompts")
     searxng_url: str = "http://localhost:8080/search"
     # Moteurs SearXNG (séparés par des virgules), vide = moteurs par défaut de l'instance.
-    # Yahoo par défaut : les moteurs par défaut (DuckDuckGo, Brave, Google CSE) se font bloquer.
-    searxng_engines: str = "yahoo"
+    # DuckDuckGo, Brave, Google, Qwant se font bloquer (captcha / 403 / 429), Yahoo
+    # renvoie une « parsing error » (SearXNG 2026.9) et Bing ignore `site:pypi.org`.
+    # Plusieurs moteurs respectant `site:` : si l'un est suspendu (429), les autres répondent.
+    searxng_engines: str = "startpage,presearch,yandex,seznam,marginalia"
     # Options de la recherche de packages (voir AMELIORATIONS.md, section 9).
     search_multi_query: bool = True       # 1. plusieurs requêtes courtes
     search_name_guess: bool = True        # 2. noms proposés par le LLM, vérifiés sur PyPI

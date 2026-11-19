@@ -331,18 +331,20 @@ class AgentGraph:
                [self.prompts.load("tool_tester"),
                f"TOOL: \n - SPEC: {json.dumps(tool_spec, ensure_ascii=False, indent=2)}\n - FILE: \n {self.config.project_dir / (tool_spec["name"] + ".py")} \n - CODE: \n {code}"],
                )
-        prompt = result.model_dump()["content"]
-        
+        prompt = result.content
         logger.info("Commande de test proposée: %s", prompt)
-        execution = run_command(
+        test_result = run_command(
             prompt,
             self.config.project_dir,
             self.config.command_timeout,
         )
+        if test_result["ok"] and not test_result["stdout"].strip():
+            logger.warning("Test de l'outil sans sortie (stdout vide) : rien à vérifier")
 
+        # On conserve le résultat de la commande (stdout/stderr), pas la réponse du LLM.
         execution = list(state.get("execution", []))
-        execution.append(result)
-        
+        execution.append(test_result)
+
         return {"execution": execution}
 
     def verify_code_package(self, state: AgentState):
@@ -356,24 +358,33 @@ class AgentGraph:
         with open(self.config.project_dir / (tool_spec["name"] + ".py"), "r") as f:
                         code = f.read()
         user_prompt = f"PACKAGE USAGE: {json.dumps(analysed_package.usage_context, ensure_ascii=False, indent=2)} \n TASK: {json.dumps(tool_spec, ensure_ascii=False, indent=2)} \n TOOL CODE: \n {code} \n EXAMPLE RESULT: \n {execution}"
-        result = self.llm.structured(
-            ToolEvaluationOutput
-            ,self.prompts.load("tool_verifier"),
-             user_prompt
-        )
         logger.debug("USER PROMPT:\n%s", user_prompt)
+        result = self.llm.structured(
+            ToolEvaluationOutput,
+            self.prompts.load("tool_verifier"),
+            user_prompt,
+        )
 
-        result = result.model_dump()
-
-        logger.info("Vérification outil: %s", preview(result))
+        logger.info("Vérification outil: %s", preview(result.model_dump()))
         if result.success:
-            return {"tool_success":result.success}
+            return {"tool_success": True}
         del packages[0]
         # modify code if not working
-        code = result.code.model_dump()
+        logger.debug("Code corrigé proposé par le vérificateur:\n%s", result.code)
         with open(self.config.project_dir / (tool_spec["name"] + ".py"), "a") as f:
-            f.write(code)
-        return {"tool_success":result.success, "current_packages": packages}
+            f.write(result.code)
+        if not packages:
+            logger.error(
+                "Vérification de l'outil %s échouée et plus aucun package candidat",
+                tool_spec.get("name"),
+            )
+            return {
+                "tool_success": False,
+                "current_packages": packages,
+                "fatal_error": "Outil généré invalide : plus aucun package candidat.",
+            }
+        logger.info("%d package(s) candidat(s) restant(s)", len(packages))
+        return {"tool_success": False, "current_packages": packages}
             
 
                 
@@ -614,6 +625,8 @@ class AgentGraph:
     @staticmethod
     def route_after_verify_code(state: AgentState) -> str:
                 """Route vers l'éxécution d'une tâche ou l'installation d'un paquet."""
+                if state.get("fatal_error"):
+                    return "finish"
                 if state.get("tool_success"):
                     return "register_tools"
         
@@ -725,6 +738,7 @@ class AgentGraph:
                                             { 
                                                 "execute_code_for_package": "execute_code_for_package",
                                                 "register_tools": "register_tools",
+                                                "finish": "finish",
                                             },
                                         )
 
