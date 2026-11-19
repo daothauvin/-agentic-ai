@@ -2,13 +2,18 @@
 
 import json
 import os
+import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from langgraph.graph import END, START, StateGraph
 from .config import AgentConfig
 from .execution import compact, run_command
-from .toolsearch import ToolSearchService
+from .toolsearch import ToolSearchService, pypi_name_from_url
+from .package_registry import PackageRecord, PackageRegistry, VerifiedUsage
+from .package_advisor import PackageAdvisor
+from .rag import BgeM3Embedder
 from .llm import LocalLLM
 from langgraph.checkpoint.sqlite import SqliteSaver
 import re
@@ -34,10 +39,12 @@ MERMAID_ARCHITECTURE = """graph TD
     START([START]) --> INSPECT[inspect_environment]
     INSPECT --> PLAN[plan]
     PLAN --> SELECT[select_task]
-    SELECT -->|tâche prête| PREPARE[prepare_task]
+    SELECT -->|tâche prête| FIND[find_installed_packages]
     SELECT -->|pas de tâche| FINISH[finish]
+    FIND --> PREPARE[prepare_task]
     PREPARE -->|besoin d'outil| SEARCH[search_tools]
     PREPARE -->|outil existe| EXECUTE[execute_commands]
+    PREPARE -->|trop de recherches| FINISH
     SEARCH --> ANALYSIS[analysis_package]
     ANALYSIS --> ELIGIBLE[record_eligible_package]
     ELIGIBLE --> |True| INSTALL[install_package]
@@ -45,12 +52,13 @@ MERMAID_ARCHITECTURE = """graph TD
 
     INSTALL --> |nécessite code|CONSTRUCT[construct_code_for_package]
     INSTALL --> |échoue|ANALYSIS[analysis_package]
-    INSTALL --> |pas besoin code|REGISTER[register_tools]
-    CONSTRUCT --> EXECUTE_CODE[execute_code_for_package]
+    INSTALL --> |CLI, sans code|EXECUTE_CODE[execute_code_for_package]
+    CONSTRUCT --> EXECUTE_CODE
     EXECUTE_CODE --> VERIFY_CODE[verify_code_package]
     VERIFY_CODE --> |réussi| REGISTER[register_tools]
-    VERIFY_CODE --> |rate| --> EXECUTE_CODE[execute_code_for_package]
-    REGISTER --> PREPARE[search_tools]
+    VERIFY_CODE --> |rate, correction| EXECUTE_CODE
+    VERIFY_CODE --> |rate, paquet abandonné| ANALYSIS
+    REGISTER --> |sauvegarde du paquet| FIND
     EXECUTE --> EVALUATE[evaluate]
     EVALUATE -->|success| RECORD[record_success]
     RECORD --> SELECT
@@ -72,6 +80,12 @@ class AgentGraph:
         self.tools = ToolManager(config.project_dir)
         
         self.prompts = PromptLoader(config.prompts_dir)
+        # Registre des paquets vérifiés (avant ToolSearchService, qui l'utilise au classement).
+        self.packages = PackageRegistry(
+            config.project_dir / ".agent",
+            embedder=BgeM3Embedder(config.ollama_url).embed,
+        )
+        self.advisor = PackageAdvisor(self.llm, self.prompts, self.packages, config)
         self.package_analyzer = ToolSearchService(self)
         self.graph = self._build_graph()
 
@@ -180,8 +194,38 @@ class AgentGraph:
         }
         
     
+    def find_installed_packages(self, state: AgentState) -> dict[str, Any]:
+        """Cherche, parmi les paquets déjà vérifiés, ceux utilisables pour la tâche.
+
+        RAG (bge-m3) sur le registre ``.agent/packages.json`` puis vérification
+        LLM paquet par paquet ; le résultat (description courte + exemple de
+        commande pour la tâche) est injecté dans le prompt de ``prepare_task``.
+
+        Args:
+            state: État courant (``current_task``).
+
+        Returns:
+            Mise à jour ``package_hints``.
+        """
+
+        hints = self.advisor.hints_for_task(state.get("current_task"))
+        logger.info("Paquets installés retenus pour la tâche: %s", [h["name"] for h in hints])
+        return {"package_hints": hints}
+
     def prepare_task(self, state: AgentState) -> dict[str, Any]:
-        """Demande au LLM un plan d'exécution."""
+        """Demande au LLM un plan d'exécution.
+
+        Les paquets installés jugés utilisables (``package_hints``) sont décrits
+        dans le prompt avec un exemple d'utilisation pour la tâche. Si le plan
+        est ``IMPOSSIBLE`` alors que la tâche a déjà déclenché
+        ``max_tool_searches_per_task`` recherches de paquet, on s'arrête.
+
+        Args:
+            state: État courant.
+
+        Returns:
+            Mise à jour ``current_plan`` (et ``fatal_error`` si bloqué).
+        """
 
         task = state["current_task"]
         if task is None:
@@ -192,6 +236,8 @@ class AgentGraph:
             for dependency in task.get("depends_on", [])
         }
 
+        packages = self.advisor.format_hints(state.get("package_hints") or [])
+        logger.debug("Paquets installés décrits au planificateur:\n%s", packages)
         taskplanner_prompt = self.prompts.render(
             "task_planner",
             environment=json.dumps(
@@ -199,7 +245,8 @@ class AgentGraph:
                 ensure_ascii=False,
                 indent=2,
             ),
-            dependencies = dependencies
+            dependencies=dependencies,
+            packages=packages,
         )
 
         user_task = task.copy()
@@ -217,10 +264,18 @@ class AgentGraph:
         )
         logger.info("Plan de tâche: expected=%s | commands=%s", result.expected, result.commands)
 
-        return {
+        update: dict[str, Any] = {
             "current_plan": result.model_dump(),
             "execution": [],
         }
+        searches = (state.get("tool_searches") or {}).get(task.get("id", ""), 0)
+        if result.expected == "IMPOSSIBLE" and searches >= self.config.max_tool_searches_per_task:
+            logger.error("Tâche %s toujours IMPOSSIBLE après %d recherche(s) de paquet",
+                         task.get("id"), searches)
+            update["fatal_error"] = (
+                f"Tâche impossible même après {searches} recherche(s) de paquet."
+            )
+        return update
 
     
     def search_tools(self, state: AgentState):
@@ -240,16 +295,22 @@ class AgentGraph:
             packages = packages[:limit]
         logger.info("Packages candidats: %s", [p.url for p in packages])
 
+        task_id = (state.get("current_task") or {}).get("id", "")
+        searches = dict(state.get("tool_searches") or {})
+        searches[task_id] = searches.get(task_id, 0) + 1
+
         if not packages:
             return {
                 "current_tool": tool_spec,
                 "current_packages": [],
+                "tool_searches": searches,
                 "fatal_error": "Aucun package trouvé pour l'outil requis.",
             }
 
         return {
-            "current_tool": tool_spec, 
-            "current_packages": packages
+            "current_tool": tool_spec,
+            "current_packages": packages,
+            "tool_searches": searches,
         }
 
     def analysis_package(self, state: AgentState):
@@ -275,17 +336,36 @@ class AgentGraph:
             return self._next_package_or_fail(state, {"eligible_package": False})
     
     def install_package(self, state: AgentState):
+        """Installe le package candidat et choisit son mode de vérification.
+
+        ``cli`` : le paquet s'utilise directement en ligne de commande, sans
+        code généré ; ``python`` : un outil Python est généré puis testé.
+
+        Args:
+            state: État courant (``current_packages[0]`` analysé).
+
+        Returns:
+            Mise à jour ``installed_package``, ``tool_mode``, compteurs remis à zéro.
+        """
+
         analysed_package = state["current_packages"][0]
-        
+
         if not self.package_analyzer.install_package(analysed_package):
             logger.warning("Échec d'installation: %s", analysed_package.url)
             del state["current_packages"][0]
             return self._next_package_or_fail(state, {"installed_package": False})
-        
-        if not analysed_package.package_use.shell_use:
-             return {"installed_package": True}
-        return {"installed_package": True}
-           
+
+        mode = "cli" if analysed_package.package_use.shell_use else "python"
+        logger.info("Paquet installé: %s | vérification en mode %s", analysed_package.url, mode)
+        return {
+            "installed_package": True,
+            "tool_mode": mode,
+            "tool_command": None,
+            "tool_attempts": 0,
+            "tool_success": None,
+            "tool_retry": False,
+            "execution": [],
+        }
 
     @staticmethod
     def _next_package_or_fail(state: AgentState, update: dict[str, Any]) -> dict[str, Any]:
@@ -300,41 +380,95 @@ class AgentGraph:
             logger.info("%d package(s) candidat(s) restant(s)", remaining)
         return update
 
+    def _tool_path(self, tool_spec: dict[str, Any]) -> Path:
+        """Chemin du fichier de l'outil Python en cours de vérification.
+
+        Args:
+            tool_spec: Spécification de l'outil.
+
+        Returns:
+            Chemin ``<workspace>/<nom>.py``.
+        """
+
+        return self.config.project_dir / (tool_spec["name"] + ".py")
+
     def construct_code_for_package(self, state: AgentState):
-                    
+        """Génère l'outil Python qui utilise le paquet (mode ``python``).
+
+        Args:
+            state: État courant.
+
+        Returns:
+            Mise à jour des compteurs de vérification.
+        """
+
         analysed_package = state["current_packages"][0]
         tool_spec = state["current_tool"]
         system_prompt = self.prompts.load("tool_generator")
         logger.debug("SYS PROMPT:\n%s", system_prompt)
 
-        user_prompt =f"TASK: \n {json.dumps(tool_spec, ensure_ascii=False, indent=2)} \n\n PACKAGE: \n {json.dumps(analysed_package.usage_context, ensure_ascii=False, indent=2)}" 
+        user_prompt = (
+            f"TASK: \n {json.dumps(tool_spec, ensure_ascii=False, indent=2)} \n\n"
+            f" PACKAGE: \n {json.dumps(analysed_package.usage_context, ensure_ascii=False, indent=2)}"
+        )
         logger.debug("USER PROMPT:\n%s", user_prompt)
         result = self.llm.structured(
             CodeOutput,
             system_prompt,
-            user_prompt
-            )
-        code = result.code
+            user_prompt,
+        )
+        code = strip_code_fences(result.code)
         logger.debug("CODE:\n%s", code)
-        with open(self.config.project_dir / (tool_spec["name"] + ".py"), "w") as f:
-            f.write(code)
-        logger.info("Outil écrit: %s", self.config.project_dir / (tool_spec["name"] + ".py"))
-        
+        path = self._tool_path(tool_spec)
+        path.write_text(code, encoding="utf-8")
+        logger.info("Outil écrit: %s", path)
+        return {"tool_mode": "python", "tool_attempts": 0, "tool_command": None, "execution": []}
 
-                    
     def execute_code_for_package(self, state: AgentState):
+        """Teste le paquet : exécute l'outil Python généré, ou la commande du paquet.
+
+        * mode ``python`` : le LLM (prompt ``tool_tester``) propose
+          ``python3 FICHIER ARGUMENTS`` ;
+        * mode ``cli`` : le paquet est utilisé directement, sans code ; le LLM
+          (prompt ``package_cli_tester``) propose la commande à partir de la doc.
+          Après un échec, la commande corrigée par le vérificateur est rejouée.
+
+        Args:
+            state: État courant.
+
+        Returns:
+            Mise à jour ``execution`` (résultat de la commande) et ``tool_command``.
+        """
+
         tool_spec = state["current_tool"]
-        with open(self.config.project_dir / (tool_spec["name"] + ".py"), "r") as f:
-                code = f.read()
-        logger.debug("TOOL FILE: %s\nCODE:\n%s", self.config.project_dir / (tool_spec["name"] + ".py"), code)
-        result = self.llm.model.invoke(
-               [self.prompts.load("tool_tester"),
-               f"TOOL: \n - SPEC: {json.dumps(tool_spec, ensure_ascii=False, indent=2)}\n - FILE: \n {self.config.project_dir / (tool_spec["name"] + ".py")} \n - CODE: \n {code}"],
-               )
-        prompt = result.content
-        logger.info("Commande de test proposée: %s", prompt)
+        mode = state.get("tool_mode") or "python"
+
+        if mode == "cli":
+            package = state["current_packages"][0]
+            command = state.get("tool_command")
+            if not command:
+                name = pypi_name_from_url(package.url) or package.title
+                result = self.llm.model.invoke([
+                    self.prompts.load("package_cli_tester"),
+                    f"PACKAGE: {name}\n"
+                    f"SPEC: {json.dumps(tool_spec, ensure_ascii=False, indent=2)}\n"
+                    f"DOCUMENTATION:\n{package.usage_context}",
+                ])
+                command = strip_code_fences(result.content)
+        else:
+            path = self._tool_path(tool_spec)
+            code = path.read_text(encoding="utf-8")
+            logger.debug("TOOL FILE: %s\nCODE:\n%s", path, code)
+            result = self.llm.model.invoke([
+                self.prompts.load("tool_tester"),
+                f"TOOL: \n - SPEC: {json.dumps(tool_spec, ensure_ascii=False, indent=2)}\n"
+                f" - FILE: \n {path} \n - CODE: \n {code}",
+            ])
+            command = strip_code_fences(result.content)
+
+        logger.info("Commande de test proposée (%s): %s", mode, command)
         test_result = run_command(
-            prompt,
+            command,
             self.config.project_dir,
             self.config.command_timeout,
         )
@@ -345,34 +479,70 @@ class AgentGraph:
         execution = list(state.get("execution", []))
         execution.append(test_result)
 
-        return {"execution": execution}
+        return {"execution": execution, "tool_command": command}
 
     def verify_code_package(self, state: AgentState):
-        '''
-         A verif
-        '''
+        """Vérifie le test du paquet ; corrige puis réessaie, ou abandonne le paquet.
+
+        Seul un paquet validé ici atteint ``register_tools`` (et donc le registre).
+        Échec : jusqu'à ``max_tool_fix_attempts`` corrections (code Python
+        réécrit, ou commande corrigée en mode ``cli``), puis le paquet est
+        abandonné au profit du candidat suivant.
+
+        Args:
+            state: État courant.
+
+        Returns:
+            Mise à jour ``tool_success`` / ``tool_retry`` / ``current_packages``.
+        """
+
         analysed_package = state["current_packages"][0]
         tool_spec = state["current_tool"]
         execution = state["execution"][-1]
         packages = state["current_packages"]
-        with open(self.config.project_dir / (tool_spec["name"] + ".py"), "r") as f:
-                        code = f.read()
-        user_prompt = f"PACKAGE USAGE: {json.dumps(analysed_package.usage_context, ensure_ascii=False, indent=2)} \n TASK: {json.dumps(tool_spec, ensure_ascii=False, indent=2)} \n TOOL CODE: \n {code} \n EXAMPLE RESULT: \n {execution}"
+        mode = state.get("tool_mode") or "python"
+
+        if mode == "cli":
+            system_prompt = self.prompts.load("cli_verifier")
+            tried = f"COMMAND: \n {state.get('tool_command')}"
+        else:
+            system_prompt = self.prompts.load("tool_verifier")
+            tried = f"TOOL CODE: \n {self._tool_path(tool_spec).read_text(encoding='utf-8')}"
+        user_prompt = (
+            f"PACKAGE USAGE: {json.dumps(analysed_package.usage_context, ensure_ascii=False, indent=2)} \n"
+            f" TASK: {json.dumps(tool_spec, ensure_ascii=False, indent=2)} \n"
+            f" {tried} \n EXAMPLE RESULT: \n {execution}"
+        )
         logger.debug("USER PROMPT:\n%s", user_prompt)
         result = self.llm.structured(
             ToolEvaluationOutput,
-            self.prompts.load("tool_verifier"),
+            system_prompt,
             user_prompt,
         )
 
-        logger.info("Vérification outil: %s", preview(result.model_dump()))
+        logger.info("Vérification outil (%s): %s", mode, preview(result.model_dump()))
+        if result.success and execution.get("ok"):
+            return {"tool_success": True, "tool_retry": False}
         if result.success:
-            return {"tool_success": True}
+            logger.warning("Vérificateur positif mais commande en échec (code %s) : refusé",
+                           execution.get("returncode"))
+
+        attempts = int(state.get("tool_attempts") or 0) + 1
+        fix = strip_code_fences(result.code or "")
+        if attempts <= self.config.max_tool_fix_attempts and fix:
+            logger.info("Correction %d/%d du paquet %s", attempts,
+                        self.config.max_tool_fix_attempts, analysed_package.url)
+            logger.debug("Correction proposée par le vérificateur:\n%s", fix)
+            update = {"tool_success": False, "tool_retry": True, "tool_attempts": attempts}
+            if mode == "cli":
+                update["tool_command"] = fix
+            else:
+                self._tool_path(tool_spec).write_text(fix, encoding="utf-8")
+                update["tool_command"] = None
+            return update
+
+        logger.warning("Paquet abandonné après %d tentative(s): %s", attempts, analysed_package.url)
         del packages[0]
-        # modify code if not working
-        logger.debug("Code corrigé proposé par le vérificateur:\n%s", result.code)
-        with open(self.config.project_dir / (tool_spec["name"] + ".py"), "a") as f:
-            f.write(result.code)
         if not packages:
             logger.error(
                 "Vérification de l'outil %s échouée et plus aucun package candidat",
@@ -380,64 +550,95 @@ class AgentGraph:
             )
             return {
                 "tool_success": False,
+                "tool_retry": False,
                 "current_packages": packages,
                 "fatal_error": "Outil généré invalide : plus aucun package candidat.",
             }
         logger.info("%d package(s) candidat(s) restant(s)", len(packages))
-        return {"tool_success": False, "current_packages": packages}
-            
-
-                
+        return {"tool_success": False, "tool_retry": False, "current_packages": packages}
 
     def register_tools(self, state: AgentState) -> dict[str, Any]:
-        """Enregistre les outils générés et installe leurs dépendances."""
+        """Sauvegarde le paquet vérifié (et son outil) dans le registre.
 
-        raise
+        La fiche garde toutes les informations disponibles : métadonnées PyPI
+        (version, résumé, mots-clés, page d'accueil), analyse d'installation et
+        d'usage, extraits de doc, outil Python généré et commande validée, et
+        une description + des capacités rédigées par le LLM (index RAG).
 
-        plan = state.get("current_plan", {})
-        execution = list(state.get("execution", []))
+        Args:
+            state: État courant (paquet validé en ``current_packages[0]``).
 
-        for raw_tool in plan.get("tools", []):
-            tool = GeneratedTool.model_validate(raw_tool)
-            self.tools.register_generated_tool(tool)
+        Returns:
+            Remise à zéro de l'état de recherche de paquet.
+        """
 
-            if not tool.packages or not tool.install_manager:
-                continue
+        package = state["current_packages"][0]
+        tool_spec = state["current_tool"] or {}
+        mode = state.get("tool_mode") or "python"
+        name = pypi_name_from_url(package.url) or package.title.lower()
+        last = (state.get("execution") or [{}])[-1]
+        command = state.get("tool_command") or last.get("command", "")
 
-            package_args = " ".join(
-                shlex_quote(package)
-                for package in tool.packages
-            )
+        tool_file = None
+        if mode == "python":
+            source = self._tool_path(tool_spec)
+            target = self.tools.tools_dir / source.name
+            shutil.copyfile(source, target)
+            tool_file = str(target)
+            command = command.replace(str(source), tool_file)
+            self.tools.record_tool(tool_spec.get("name", source.stem),
+                                   tool_spec.get("description", ""), target, [name])
+            logger.info("Outil Python sauvegardé: %s", target)
 
-            commands = {
-                "pip": f"python3 -m pip install {package_args}",
-                "apt": (
-                    "sudo apt-get update && "
-                    f"sudo apt-get install -y {package_args}"
-                ),
-                "npm": f"npm install {package_args}",
-                "cargo": f"cargo install {package_args}",
-            }
+        info = (self.package_analyzer.fetch_pypi_json_by_name(name) or {}).get("info") or {}
+        install = package.package_install
+        use = package.package_use
+        urls = info.get("project_urls") or {}
+        keywords = info.get("keywords") or ""
+        record = PackageRecord(
+            name=name,
+            title=info.get("name") or package.title,
+            url=package.url,
+            version=info.get("version") or "",
+            summary=info.get("summary") or package.content,
+            keywords=[k.strip() for k in keywords.replace(";", ",").split(",") if k.strip()]
+            if isinstance(keywords, str) else list(keywords),
+            homepage=info.get("home_page") or urls.get("Homepage") or urls.get("Source") or "",
+            manager="pip" if (install is None or install.pip_install) else "apt",
+            install_commands=self.package_analyzer.last_install_commands
+            or (install.install_commands if install else []),
+            python_use=bool(use and use.python_use),
+            shell_use=bool(use and use.shell_use),
+            requires_api_key=bool((use and use.requires_API_key) or (install and install.requires_API_key)),
+            paid=bool((use and use.paid) or (install and install.paid)),
+            usage_context=package.usage_context or "",
+            usages=[VerifiedUsage(
+                tool_name=tool_spec.get("name", ""),
+                tool_description=tool_spec.get("description", ""),
+                tool_input=tool_spec.get("input", ""),
+                tool_output=tool_spec.get("output", ""),
+                mode=mode,
+                tool_file=tool_file,
+                command=command,
+                output_preview=compact(last.get("stdout", ""), 1000),
+                verified_at=datetime.now().isoformat(timespec="seconds"),
+            )],
+        )
+        described = self.advisor.describe(record)
+        record.description = described.description
+        record.capabilities = described.capabilities
+        self.packages.add(record)
+        self.tools.record_packages([name], record.manager)
 
-            command = commands.get(tool.install_manager)
-
-            if not command:
-                continue
-
-            result = run_command(
-                command,
-                self.config.project_dir,
-                self.config.command_timeout,
-            )
-            execution.append(result)
-
-            if result.get("ok"):
-                self.tools.record_packages(
-                    tool.packages,
-                    tool.install_manager,
-                )
-
-        return {"execution": execution}
+        return {
+            "current_packages": [],
+            "package_hints": [],
+            "tool_success": None,
+            "tool_retry": False,
+            "tool_command": None,
+            "tool_attempts": 0,
+            "execution": [],
+        }
 
     def execute_commands(self, state: AgentState) -> dict[str, Any]:
         """Exécute une commande par étape et conserve chaque résultat."""
@@ -590,13 +791,15 @@ class AgentGraph:
             return "finish"
 
         if state.get("current_task"):
-            return "prepare_task"
+            return "find_installed_packages"
 
         return "finish"
     
     @staticmethod
     def route_after_prepare(state: AgentState) -> str:
             """Route vers l'éxécution d'une tâche ou l'installation d'un paquet."""
+            if state.get("fatal_error"):
+                return "finish"
             if state.get("current_plan").get("expected") == "IMPOSSIBLE":
                 logger.info("Tâche jugée IMPOSSIBLE avec les outils actuels -> recherche d'outil")
                 return "search_tools"
@@ -618,9 +821,10 @@ class AgentGraph:
                     return "finish"
                 if not state.get("installed_package"):
                     return "analysis_package"
-                if not (state.get("current_packages")[0].package_use.shell_use):
-                    return "construct_code_for_package"
-                return "register_tools"
+                if state.get("tool_mode") == "cli":
+                    # Paquet utilisable directement en ligne de commande : test sans code.
+                    return "execute_code_for_package"
+                return "construct_code_for_package"
 
     @staticmethod
     def route_after_verify_code(state: AgentState) -> str:
@@ -629,8 +833,10 @@ class AgentGraph:
                     return "finish"
                 if state.get("tool_success"):
                     return "register_tools"
-        
-                return "execute_code_for_package"
+                if state.get("tool_retry"):
+                    return "execute_code_for_package"
+                # Paquet abandonné : analyse du candidat suivant.
+                return "analysis_package"
     
 
     @staticmethod
@@ -669,6 +875,7 @@ class AgentGraph:
         builder.add_node("verify_code_package", timed_node(self.verify_code_package))
         builder.add_node("register_tools", timed_node(self.register_tools))
 
+        builder.add_node("find_installed_packages", timed_node(self.find_installed_packages))
         builder.add_node("prepare_task", timed_node(self.prepare_task))
         
         builder.add_node("execute_commands", timed_node(self.execute_commands))
@@ -687,10 +894,11 @@ class AgentGraph:
             "select_task",
             self.route_after_select,
             {
-                "prepare_task": "prepare_task",
+                "find_installed_packages": "find_installed_packages",
                 "finish": "finish",
             },
         )
+        builder.add_edge("find_installed_packages", "prepare_task")
 
         builder.add_conditional_edges(
                     "prepare_task",
@@ -698,6 +906,7 @@ class AgentGraph:
                     { 
                         "search_tools": "search_tools",
                         "execute_commands": "execute_commands",
+                        "finish": "finish",
                     },
                 )
     
@@ -722,8 +931,8 @@ class AgentGraph:
                                     self.route_after_install,
                                     { 
                                         "construct_code_for_package": "construct_code_for_package",
+                                        "execute_code_for_package": "execute_code_for_package",
                                         "analysis_package": "analysis_package",
-                                        "register_tools": "register_tools",
                                         "finish": "finish",
                                     },
                                 )
@@ -737,13 +946,15 @@ class AgentGraph:
                                             self.route_after_verify_code,
                                             { 
                                                 "execute_code_for_package": "execute_code_for_package",
+                                                "analysis_package": "analysis_package",
                                                 "register_tools": "register_tools",
                                                 "finish": "finish",
                                             },
                                         )
 
 
-        builder.add_edge("register_tools", "prepare_task")
+        # Le paquet sauvegardé est retrouvé par find_installed_packages puis décrit à prepare_task.
+        builder.add_edge("register_tools", "find_installed_packages")
         # builder.add_edge("prepare_task", "execute_commands")
         builder.add_edge("execute_commands", "evaluate")
 
@@ -839,6 +1050,21 @@ class AgentGraph:
             or "La demande n'a pas pu être terminée.",
         )
         return 1
+
+def strip_code_fences(text: str) -> str:
+    """Retire les blocs ```...``` qu'ajoute parfois le LLM autour d'une commande/code.
+
+    Args:
+        text: Réponse brute du LLM.
+
+    Returns:
+        Texte sans délimiteurs de bloc de code, espaces de bord retirés.
+    """
+
+    text = (text or "").strip()
+    match = re.match(r"^```[\w+-]*\n(.*?)\n?```$", text, re.S)
+    return match.group(1).strip() if match else text
+
 
 def shlex_quote(value: str) -> str:
     """Protège une valeur avant son insertion dans une commande shell."""

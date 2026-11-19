@@ -136,6 +136,25 @@ class ToolEvaluationOutput(BaseModel):
     code: str
 
 
+class PackageDescription(BaseModel):
+    """Description d'un paquet vérifié, rédigée au moment de sa sauvegarde."""
+
+    description: str = Field(description="One or two sentences: what the package does.")
+    capabilities: list[str] = Field(
+        default_factory=list,
+        description="3 to 8 short tasks the package can perform (e.g. 'download youtube video').",
+    )
+
+
+class PackageMatch(BaseModel):
+    """Décision : un paquet déjà installé peut-il servir à la tâche ?"""
+
+    # La description vient en premier : le petit modèle décide mieux après l'avoir écrite.
+    description: str = Field(default="", description="Short description of what the package does.")
+    usable: bool = Field(description="True if the package can perform the task.")
+    example: str = Field(default="", description="Shell command using the package for this exact task.")
+
+
 class ResolutionOutput(BaseModel):
     """Plan de réparation produit après un échec."""
 
@@ -164,6 +183,13 @@ class AgentState(TypedDict, total=False):
     current_packages: list[Package] | None = Field(default_factory=list)
     eligible_package: bool | None
     installed_package: bool | None
+    # Sauvegarde des paquets (voir agent/package_registry.py).
+    package_hints: list[dict[str, Any]]
+    tool_mode: str | None
+    tool_command: str | None
+    tool_attempts: int
+    tool_retry: bool
+    tool_searches: dict[str, int]
     
     
     

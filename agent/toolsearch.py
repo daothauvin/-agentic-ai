@@ -21,6 +21,7 @@ from .models import (
 from .execution import run_command
 from urllib.parse import urljoin
 from .rag import PackageRAG
+from .package_advisor import tool_query
 from .logger import get_logger, preview, timed
 
 logger = get_logger("toolsearch")
@@ -38,6 +39,12 @@ class ToolSearchService:
         self.prompts = agent.prompts
         self.config = agent.config
         self.tools = agent.tools
+        # Registre des paquets vérifiés (absent dans les benchs de recherche).
+        self.registry = getattr(agent, "packages", None)
+        #: Commande(s) d'installation qui ont réussi lors du dernier install_package.
+        self.last_install_commands: list[str] = []
+        #: Paquets installés ajoutés au dernier classement (benchs / logs).
+        self.last_installed_candidates: list[str] = []
         self.rag = PackageRAG(
             ollama_url=self.config.ollama_url,
             cache_dir=self.config.project_dir / ".rag",
@@ -166,7 +173,7 @@ class ToolSearchService:
             with timed("Filtre métadonnées PyPI", logger):
                 results = self.filter_by_metadata(results)
 
-        if self.config.search_prerank and results:
+        if self.config.search_prerank and (results or self.registry is not None):
             with timed("Classement LLM des candidats", logger):
                 results = self.rank_candidates(results, tool_spec)
 
@@ -321,11 +328,66 @@ class ToolSearchService:
                 kept.append(package)
         return kept
 
+    def installed_candidates(self, tool_spec) -> list[Package]:
+        """Paquets déjà installés et vérifiés proches de l'outil recherché (RAG).
+
+        Args:
+            tool_spec: Spécification de l'outil.
+
+        Returns:
+            Paquets du registre au format ``Package`` (``content`` = description).
+        """
+
+        if self.registry is None or not self.config.registry_in_rank:
+            return []
+        try:
+            found = self.registry.search(
+                tool_query(tool_spec),
+                k=self.config.registry_rank_k,
+                min_score=self.config.registry_min_score,
+            )
+        except Exception as error:
+            logger.warning("Registre de paquets indisponible pour le classement: %s", error)
+            return []
+        logger.info("Paquets installés ajoutés au classement: %s",
+                    [(r.name, round(score, 3)) for r, score in found])
+        return [
+            Package(
+                title=record.name,
+                url=f"https://pypi.org/project/{record.name}/",
+                content=record.description or record.summary,
+                package_use=None, package_install=None,
+                usage_context=record.usage_context or None, tree=None,
+            )
+            for record, _ in found
+        ]
+
     def rank_candidates(self, packages: list[Package], tool_spec) -> list[Package]:
-        """3. Un seul appel LLM classe les candidats sur leur nom et leur résumé."""
+        """3. Un seul appel LLM classe les candidats sur leur nom et leur résumé.
+
+        Les paquets déjà installés et vérifiés proches de l'outil (registre)
+        sont ajoutés en tête de liste, marqués ``[INSTALLED]``.
+
+        Args:
+            packages: Candidats issus de la recherche web.
+            tool_spec: Spécification de l'outil.
+
+        Returns:
+            Candidats classés, du plus au moins pertinent.
+        """
+
+        installed = self.installed_candidates(tool_spec)
+        installed_names = {pypi_name_from_url(p.url) for p in installed}
+        self.last_installed_candidates = sorted(installed_names)
+        web = [p for p in packages if pypi_name_from_url(p.url) not in installed_names]
+        packages = installed + web
+        if not packages:
+            return []
 
         listing = "\n".join(
-            f"{i}. {pypi_name_from_url(p.url) or p.title} — {preview(p.content, 200)}"
+            f"{i}. {pypi_name_from_url(p.url) or p.title}"
+            f"{' [INSTALLED]' if pypi_name_from_url(p.url) in installed_names else ''}"
+            f" — {preview(p.content, 200)}"
             for i, p in enumerate(packages, start=1)
         )
         logger.debug("Candidats soumis au classement LLM:\n%s", listing)
@@ -347,7 +409,7 @@ class ToolSearchService:
                 "les candidats analysés risquent d'être hors sujet",
                 result.ranking,
             )
-            return packages
+            return web or packages
         return [packages[i] for i in order]
 
     def monthly_downloads(self, name: str) -> int | None:
@@ -679,6 +741,7 @@ class ToolSearchService:
         if not installation.install_commands:
             logger.warning("Aucune commande d'installation fournie pour %s", analysis.url)
 
+        self.last_install_commands = []
         for command in installation.install_commands:
 
             result = run_command(
@@ -688,6 +751,7 @@ class ToolSearchService:
             )
 
             if result.get("ok"):
+                self.last_install_commands = [command]
                 return True
             logger.warning("Installation échouée: %s -> %s", command, preview(result["stderr"]))
 

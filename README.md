@@ -31,6 +31,7 @@ Agent Linux autonome expérimental basé sur **LangChain**, **LangGraph** et **O
   - [Bench de la recherche de packages (Phoenix)](#bench-de-la-recherche-de-packages-phoenix)
   - [Bench du RAG de documentation (Phoenix)](#bench-du-rag-de-documentation-phoenix)
   - [Bench étape par étape](#bench-étape-par-étape)
+  - [Bench de la sauvegarde des paquets (Phoenix)](#bench-de-la-sauvegarde-des-paquets-phoenix)
 - [Logs et suivi des performances](#logs-et-suivi-des-performances)
 - [Roadmap](#roadmap)
 - [Références](#références)
@@ -89,6 +90,8 @@ Le terminal Linux est l'outil universel : `curl`, `pip`, `apt`, `python3`… don
 
 Les états sont sauvegardés après chaque nœud par un checkpointer SQLite (`projet_<id>/checkpoints<id>.sqlite`) : on peut reprendre un run long sans tout refaire (`--checkpoint`) et inspecter l'historique. SQLite ne demande aucun service. Le registre `.agent/tools.json` est volontairement un simple fichier lisible : l'agent le reçoit dans `environment` et sait ce qu'il a déjà installé ou généré.
 
+**Sauvegarde des paquets** (`agent/package_registry.py`, `.agent/packages.json`) : un paquet n'y entre **que s'il a été installé puis validé** par la boucle `execute_code_for_package` → `verify_code_package`. La fiche garde tout ce qui est connu : métadonnées PyPI (version, résumé, mots-clés, page d'accueil), commande d'installation qui a marché, analyse d'usage (Python / CLI, clé d'API, payant), extraits de doc du RAG, outil Python généré (copié dans `.agent/tools/`) ou commande CLI validée, sortie du test, et une **description + des capacités rédigées par le LLM** (prompt `package_describer`). Les fiches sont indexées avec bge-m3 (cache `.agent/packages_embeddings.json`, recalculé seulement quand une fiche change). `--reset` vide aussi ce registre.
+
 ### Recherche d'outils : PyPI via SearXNG, puis pipeline en 5 étapes
 
 - **PyPI** : Python est déjà présent, `pip` est le gestionnaire le plus simple à automatiser, et l'API JSON de PyPI fournit le README, les versions et la compatibilité Python sans scraping.
@@ -146,11 +149,13 @@ graph TD
     START([START]) --> INSPECT[inspect_environment]
     INSPECT --> PLAN[plan]
     PLAN --> SELECT[select_task]
-    SELECT -->|tâche prête| PREPARE[prepare_task]
+    SELECT -->|tâche prête| FIND[find_installed_packages]
     SELECT -->|plus de tâche / erreur| FINISH[finish]
+    FIND --> PREPARE[prepare_task]
 
     PREPARE -->|commandes possibles| EXECUTE[execute_commands]
     PREPARE -->|expected = IMPOSSIBLE| SEARCH[search_tools]
+    PREPARE -->|IMPOSSIBLE après 2 recherches| FINISH
 
     SEARCH -->|packages trouvés| ANALYSIS[analysis_package]
     SEARCH -->|aucun package| FINISH
@@ -161,12 +166,14 @@ graph TD
     INSTALL -->|échec| ANALYSIS
     INSTALL -->|plus de candidat| FINISH
     INSTALL -->|usage Python| CONSTRUCT[construct_code_for_package]
-    INSTALL -->|usage shell| REGISTER[register_tools]
-    CONSTRUCT --> EXEC_CODE[execute_code_for_package]
+    INSTALL -->|usage CLI, sans code| EXEC_CODE[execute_code_for_package]
+    CONSTRUCT --> EXEC_CODE
     EXEC_CODE --> VERIFY[verify_code_package]
-    VERIFY -->|réussi| REGISTER
-    VERIFY -->|raté| EXEC_CODE
-    REGISTER --> PREPARE
+    VERIFY -->|réussi| REGISTER[register_tools]
+    VERIFY -->|raté, correction| EXEC_CODE
+    VERIFY -->|raté 2 fois| ANALYSIS
+    VERIFY -->|plus de candidat| FINISH
+    REGISTER -->|paquet sauvegardé| FIND
 
     EXECUTE --> EVALUATE[evaluate]
     EVALUATE -->|success| RECORD[record_success]
@@ -184,24 +191,27 @@ graph TD
 1. **`inspect_environment`** — collecte le répertoire de travail, l'OS (`uname -a`), la version de Python et le registre local des outils (`.agent/tools.json`).
 2. **`plan`** — transforme la demande en tâches atomiques (`id`, `title`, `input`, `output`, `depends_on`).
 3. **`select_task`** — choisit la première tâche dont toutes les dépendances sont terminées ; détecte les dépendances circulaires.
-4. **`prepare_task`** — demande au LLM les commandes shell de la tâche. Si le LLM répond `expected = IMPOSSIBLE`, l'agent part chercher un outil.
+4. **`find_installed_packages`** — cherche dans le registre des paquets vérifiés (`.agent/packages.json`) ceux qui peuvent servir à la tâche : RAG bge-m3 (top `registry_search_k = 3`, similarité ≥ `registry_min_score = 0.45`), puis le LLM (prompt `package_matcher`, un appel par candidat, en parallèle) décide si chaque paquet convient et écrit une courte description et **un exemple de commande pour la tâche**.
+5. **`prepare_task`** — demande au LLM les commandes shell de la tâche ; les paquets retenus à l'étape précédente sont décrits dans le prompt (section `PAQUETS INSTALLÉS UTILISABLES` de `task_planner.txt`). Si le LLM répond `expected = IMPOSSIBLE`, l'agent part chercher un outil (au plus `max_tool_searches_per_task = 2` fois par tâche, ensuite le graphe s'arrête au lieu de boucler).
 5. **Recherche d'outil** (`agent/toolsearch.py`)
    - `search_tools` : le LLM spécifie l'outil nécessaire, puis `search_packages` construit la liste des candidats (**seuls les 3 premiers sont analysés**, `max_packages_analyzed` dans `agent/config.py`) :
      1. 3 requêtes courtes générées par le LLM, envoyées à SearXNG avec `site:pypi.org`, résultats fusionnés en alternance ;
      2. jusqu'à 5 noms de packages proposés par le LLM, gardés seulement s'ils existent sur PyPI ;
      3. URLs normalisées (`pypi.org/project/<nom>/`) et dédoublonnées ;
      4. filtre sur les métadonnées PyPI : release de moins de 3 ans, compatible avec la version de Python, au moins 5000 téléchargements/mois (pypistats) ;
-     5. classement LLM sur le nom et le résumé, qui écarte les candidats hors sujet.
+     5. classement LLM sur le nom et le résumé, qui écarte les candidats hors sujet. **Les paquets déjà installés et vérifiés** proches de l'outil (RAG sur le registre, `registry_rank_k = 3`, désactivable avec `registry_in_rank`) sont ajoutés en tête de la liste, marqués `[INSTALLED]`, et le prompt demande de les classer premiers s'ils conviennent.
 
      Chaque étape s'active dans `AgentConfig` (`search_multi_query`, `search_name_guess`, `search_normalize`, `search_metadata_filter`, `search_prerank`, `search_use_request`) ;
    - `analysis_package` : JSON PyPI → chunks Markdown → index FAISS (bge-m3, mis en cache dans `projet_<id>/.rag/<nom>-<version>/`) → retrieval des passages installation/usage → analyse LLM (`PackageInstall`, `PackageUse`) ;
    - `record_eligible_package` : rejette les packages payants, à clé d'API, non installables ou inutilisables ;
-   - `install_package` : exécute les commandes d'installation proposées ;
-   - `construct_code_for_package` / `execute_code_for_package` / `verify_code_package` : génèrent, testent et vérifient un outil Python utilisant le package ;
-   - `register_tools` : enregistre l'outil dans `.agent/tools/` et `.agent/tools.json`.
-6. **`execute_commands`** — exécute les commandes dans le workspace et conserve stdout, stderr, code retour et durée.
-7. **`evaluate`** — le LLM vérifie que la tâche a réellement produit le résultat attendu.
-8. **`resolve_failure`** — génère des tâches de réparation puis retente la tâche ; profondeur limitée (`max_resolution_depth = 5`).
+   - `install_package` : exécute les commandes d'installation proposées et choisit le mode de vérification : `cli` si le paquet s'utilise en ligne de commande, sinon `python` ;
+   - mode `python` : `construct_code_for_package` génère un outil Python, `execute_code_for_package` le lance (`python3 FICHIER ARGS`, prompt `tool_tester`) ;
+   - mode `cli` (**sans code**) : `execute_code_for_package` utilise directement la commande du paquet (prompt `package_cli_tester`, à partir de la doc) ;
+   - `verify_code_package` : le LLM vérifie le résultat (prompts `tool_verifier` / `cli_verifier`) ; une commande en échec (code retour ≠ 0) n'est jamais validée. En cas d'échec, le code ou la commande corrigés sont rejoués (`max_tool_fix_attempts = 2`), puis le paquet est abandonné pour le candidat suivant ;
+   - `register_tools` : sauvegarde le paquet vérifié dans `.agent/packages.json` (fiche complète + description LLM), l'outil Python dans `.agent/tools/` et `.agent/tools.json`, puis retourne à `find_installed_packages`, qui retrouve le paquet pour la tâche.
+7. **`execute_commands`** — exécute les commandes dans le workspace et conserve stdout, stderr, code retour et durée.
+8. **`evaluate`** — le LLM vérifie que la tâche a réellement produit le résultat attendu.
+9. **`resolve_failure`** — génère des tâches de réparation puis retente la tâche ; profondeur limitée (`max_resolution_depth = 5`).
 
 ### Structure du code
 
@@ -216,6 +226,8 @@ agent/
   models.py              Modèles Pydantic et AgentState
   execution.py           Exécution des commandes shell
   tools.py               Registre des outils générés (.agent/tools.json)
+  package_registry.py    Registre des paquets vérifiés (.agent/packages.json) + recherche bge-m3
+  package_advisor.py     Description LLM des paquets, paquets utilisables pour une tâche
   rag.py                 RAG documentation PyPI : chunking multi-niveau, embeddings bge-m3, index FAISS
   create_pdf.py          Conversion du JSON PyPI en PDF (ancien pipeline PageIndex, plus utilisé)
   logger.py              Logging console + fichier, chronométrage des étapes
@@ -224,6 +236,9 @@ bench/
   phoenix_bench.py       Bench de la recherche de packages dans Arize Phoenix (top 3, rappel, MRR, temps)
   stage_bench.py         Bench étape par étape (entrées figées), suivi dans Phoenix
   rag_bench.py           Bench du RAG (sections vs multi-niveau), suivi dans Phoenix
+  registry_bench.py      Bench de la sauvegarde des paquets (RAG du registre + usage), Phoenix
+  registry_cases.json    Tâches du bench registre (2 par paquet + 5 sans paquet adapté)
+  fixtures/registry_packages.json  20 fiches de paquets connus (format register_tools)
   common.py              Configuration et outils Phoenix communs aux benchs
   fixtures/stages.json   Entrées/sorties figées de chaque étape (run de référence)
   search_cases.json      Demandes du bench et packages attendus
@@ -396,6 +411,35 @@ python bench/stage_bench.py --stage filter --label seuil1000 --set search_min_mo
 
 La recherche SearXNG seule classe mal (MRR 0,43) : ce sont les noms proposés par le LLM (2) et le classement (3) qui font remonter le bon package.
 
+### Bench de la sauvegarde des paquets (Phoenix)
+
+`bench/registry_bench.py` remplit le registre d'un workspace temporaire avec **20 paquets très connus** (`bench/fixtures/registry_packages.json`, fiches au format de `register_tools` : requests, yt-dlp, pillow, pandas, qrcode, pypdf, beautifulsoup4, markdown, openpyxl, gtts, httpie, matplotlib, python-docx, csvkit, black, speedtest-cli, cryptography, pyyaml, deep-translator, psutil). **Rien n'est installé** : on teste ce que le modèle fait des fiches. `bench/registry_cases.json` : 2 tâches par paquet + 5 tâches sans paquet adapté (mail SMTP, zip, OCR, SQLite, découpe vidéo).
+
+| test | dataset Phoenix | ce qui est appelé | métriques |
+|---|---|---|---|
+| `retrieval` : le RAG retrouve-t-il le bon paquet ? | `agent-registry-retrieval` | nœud `find_installed_packages` (RAG bge-m3 + `package_matcher`) | `rag_top1`, `rag_topk`, `rag_rr` (avant LLM, tâches positives), `selected_ok` (bon paquet retenu, ou rien pour une tâche négative), `selected_precision`, `false_positive` |
+| `usage` : le modèle utilise-t-il bien le paquet ? | `agent-registry-usage` | `PackageAdvisor.match` sur le bon paquet (`--hints oracle`, ou `--hints rag`) puis nœud `prepare_task` | `matcher_accepts`, `not_impossible`, `uses_package` (commande ou fichier d'outil du paquet), `no_reinstall`, `bash_syntax`, `io_files`, `judge` (optionnel, `--judge-model`) |
+
+```bash
+python bench/registry_bench.py --test all --label defaut
+python bench/registry_bench.py --test retrieval --label seuil050 --set registry_min_score=0.5
+python bench/registry_bench.py --test usage --label juge --judge-model qwen3.5:9b
+```
+
+Résultats (`qwen2.5:3b`, 19/11/2026) :
+
+| run | rag_top1 | rag_top3 | selected_ok | false_positive | matcher_accepts | not_impossible | uses_package | bash_syntax | io_files |
+|---|---|---|---|---|---|---|---|---|---|
+| prompts initiaux | 0,95 | 1,00 | 0,89 | 0,04 | 0,85 | 0,83 | 0,85 | 0,85 | 0,81 |
+| `package_matcher` v2 (description avant décision) + sortie `task_planner` explicite | 0,95 | 1,00 | **0,98** | 0,11 | 0,98 | 0,78 | 0,98 | 0,98 | 0,97 |
+| + règle « commande écrite ⇒ pas IMPOSSIBLE » (**défaut**) | – | – | – | – | 0,95 | **0,93** | **0,98** | 0,98 | 0,97 |
+| même config, 2e run + juge `qwen3.5:9b` | – | – | – | – | 0,95 | 0,95 | 0,98 | 0,98 | 0,97 |
+
+- Le RAG seul met le bon paquet en tête 38 fois sur 40 et toujours dans le top 3 ; les scores des tâches négatives (0,42 à 0,62) recouvrent ceux des positives (≥ 0,47), donc **le seuil ne suffit pas, la vérification LLM est nécessaire** : elle n'a retenu aucun paquet pour les 5 tâches négatives.
+- Les `false_positive` restants sont des alternatives valables retenues en plus du paquet attendu (pandas pour couper des colonnes CSV, requests pour lister des liens, csvkit `in2csv` pour un xlsx).
+- Prompts initiaux : le planificateur 3B recevait le bon exemple mais rendait `commands=[]` (6 cas) ; après l'ajout de la section SORTIE, il écrivait la bonne commande **et** `IMPOSSIBLE` (8 cas), corrigé par la règle explicite.
+- Juge `qwen3.5:9b` : **35/40 (0,875)** plans jugés corrects. Erreurs réelles du 3B : chemin de l'outil mal recopié (`extract_links.py`), argument de sortie oublié (`xlsx_to_csv.py`), argument en trop (`translate.py ... en anglais`, `resize_image.py` avec une taille non demandée) ; un rejet est une erreur du juge (yt-dlp `-o audio.mp3`).
+
 ## Logs et suivi des performances
 
 - **Console** : niveau `INFO` (modifiable avec `--log-level`).
@@ -407,7 +451,10 @@ La recherche SearXNG seule classe mal (MRR 0,43) : ce sont les noms proposés pa
   - `Package filtré (...)` : raison du rejet par le filtre métadonnées (âge de la release, téléchargements/mois) ;
   - `Classement LLM vide` : le LLM n'a retenu aucun candidat, l'ordre d'origine est conservé (packages populaires mais souvent hors sujet) ; la liste soumise est en `DEBUG` ;
   - `Test de l'outil sans sortie` : l'outil généré s'exécute sans rien afficher ;
-  - `Vérification de l'outil ... plus aucun package candidat` : fin propre de la boucle génération/vérification.
+  - `Vérification de l'outil ... plus aucun package candidat` : fin propre de la boucle génération/vérification ;
+  - `Paquet abandonné après N tentative(s)` / `Vérificateur positif mais commande en échec` : paquet non sauvegardé ;
+  - `Paquets installés proches de la tâche` / `Paquet X (score s) utilisable=...` (INFO) : RAG du registre et décision du LLM, `Registre — scores` en DEBUG ;
+  - `Tâche ... toujours IMPOSSIBLE après N recherche(s)` : arrêt au lieu de boucler search → register → prepare.
 - **Fichier RAG** : `projet_<id>/.agent/logs/rag_<date>.log` (lien `latest_rag.log`) ne contient que les logs `agent.rag`, en `DEBUG` :
   - taille du document (métadonnées / README), avec un avertissement si le README fait moins de 200 caractères ;
   - chunking : nombre de chunks, tailles min/moy/médiane/max, puis chaque chunk (`#id [section] taille : aperçu`), signalé `⚠ très court` (< 50 car.) ou `⚠ > max_chars` ;
@@ -456,7 +503,8 @@ grep "terminé en" AI_Workspace/projet_1/.agent/logs/latest.log | sed -E 's/.*te
 - [ ] générer des outils codés en Python *(code écrit, non validé de bout en bout)*
 - [ ] tests automatiques des outils générés *(code écrit, contient des bugs)*
 - [ ] remplacement automatique d'un outil défectueux *(code écrit, contient des bugs)*
-- [ ] enregistrement des outils générés (`register_tools` désactivé)
+- [x] enregistrement des paquets vérifiés et de leurs outils (`register_tools`, `.agent/packages.json`)
+- [x] réutilisation des paquets installés (`find_installed_packages`, classement `[INSTALLED]`)
 - [ ] installation des packages dans un venv dédié au workspace
 
 ### Phase 3 - sécurité

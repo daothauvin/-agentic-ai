@@ -104,6 +104,7 @@ def main() -> int:
         model = AgentGraph(config)
         if args.reset:
             model.tools.reset()
+            model.packages.reset()
 
         if args.savegraph:
             img = model.graph.get_graph().draw_mermaid_png()

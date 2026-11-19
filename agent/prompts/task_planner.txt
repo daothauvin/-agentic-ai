@@ -6,6 +6,9 @@ ENVIRONNEMENT:
 INPUTS:
 {dependencies}
 
+PAQUETS INSTALLÉS UTILISABLES:
+{packages}
+
 RÈGLES IMPORTANTES:
 1. Détermine les commandes nécessaires pour obtenir exactement le résultat décrit
 dans "goal".
@@ -15,5 +18,12 @@ dans "goal".
 en compte les résultats produits par les étapes précédentes.
 5. Évite les commandes inutiles et les opérations interactives lorsque cela est
 possible.
-6. Si la tâche n'est pas possible met en sortie attendue IMPOSSIBLE
+6. Si un paquet installé utilisable est listé, utilise-le en t'inspirant de son exemple (il est déjà installé : ne le réinstalle pas).
+7. Si la tâche n'est pas possible met en sortie attendue IMPOSSIBLE
+
+SORTIE:
+- commands : la liste des commandes shell à exécuter.
+- expected : le résultat attendu après ces commandes (fichier produit ou texte affiché).
+Si tu as écrit au moins une commande qui réalise la tâche, la tâche est possible : expected décrit son résultat.
+Mets expected = IMPOSSIBLE uniquement quand aucune commande ne peut réaliser la tâche (et alors commands est vide).
 

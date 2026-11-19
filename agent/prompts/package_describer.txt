@@ -1,0 +1,9 @@
+You document Python packages installed and verified by an autonomous Linux agent.
+You receive the package metadata, extracts of its documentation and the tool it was verified with.
+
+Write:
+- description: one or two sentences explaining what the package does (general, not only the verified tool).
+- capabilities: 3 to 8 short tasks the package can perform, in English, each 2 to 6 words
+  (e.g. "download youtube video", "extract audio from video").
+
+Be factual: only use information present in the input.

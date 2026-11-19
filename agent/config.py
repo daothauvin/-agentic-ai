@@ -21,6 +21,12 @@ class AgentConfig:
         rag_multi_level: RAG multi-niveau (sections + phrases), voir agent/rag.py.
         rag_install_k: Nombre de chunks donnés au LLM pour l'installation.
         rag_usage_k: Nombre de chunks par requête d'usage (3 requêtes).
+        registry_search_k: Paquets installés proposés au vérificateur avant prepare_task.
+        registry_min_score: Similarité cosinus minimale (bge-m3) d'un paquet installé.
+        registry_in_rank: Ajoute les paquets installés au classement LLM des candidats.
+        registry_rank_k: Nombre maximal de paquets installés ajoutés au classement.
+        max_tool_fix_attempts: Corrections (code ou commande) tentées avant d'abandonner un paquet.
+        max_tool_searches_per_task: Recherches de paquet maximum pour une même tâche.
     """
 
     ollama_url: str
@@ -52,6 +58,13 @@ class AgentConfig:
     rag_install_k: int = 1
     rag_usage_k: int = 3
     search_use_request: bool = False      # 7. demande utilisateur transmise à la recherche (sans gain mesuré)
+    # Sauvegarde des paquets vérifiés (agent/package_registry.py, bench/registry_bench.py).
+    registry_search_k: int = 3
+    registry_min_score: float = 0.45
+    registry_in_rank: bool = True
+    registry_rank_k: int = 3
+    max_tool_fix_attempts: int = 2
+    max_tool_searches_per_task: int = 2
     
     @property
     def project_dir(self) -> Path:

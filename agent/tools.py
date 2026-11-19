@@ -60,6 +60,25 @@ class ToolManager:
 
         return target
 
+    def record_tool(self, name: str, description: str, path: Path, packages: list[str]) -> None:
+        """Enregistre un outil Python déjà écrit et vérifié.
+
+        Args:
+            name: Nom logique de l'outil.
+            description: Ce que fait l'outil.
+            path: Chemin du fichier Python.
+            packages: Paquets utilisés par l'outil.
+        """
+
+        registry = self.installed_registry()
+        registry[name] = {
+            "type": "generated",
+            "description": description,
+            "path": str(path),
+            "packages": packages,
+        }
+        self.save(registry)
+
     def record_packages(self, packages: list[str], manager: str) -> None:
         """Enregistre les packages installés par l'agent."""
 
