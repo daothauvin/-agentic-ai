@@ -1,7 +1,7 @@
 """Bench de la sauvegarde des paquets (registre + RAG + usage), suivi dans Phoenix.
 
 Le registre ``.agent/packages.json`` d'un workspace temporaire est rempli avec
-20 paquets très connus (bench/fixtures/registry_packages.json, fiches au format
+20 paquets (bench/fixtures/registry_packages.json, fiches au format
 de ``register_tools``). Rien n'est installé : on teste uniquement ce que le
 modèle fait des fiches. Cas : bench/registry_cases.json (2 tâches par paquet
 + 5 tâches sans paquet adapté, ``expected = null``).

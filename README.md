@@ -238,7 +238,7 @@ bench/
   rag_bench.py           Bench du RAG (sections vs multi-niveau), suivi dans Phoenix
   registry_bench.py      Bench de la sauvegarde des paquets (RAG du registre + usage), Phoenix
   registry_cases.json    Tâches du bench registre (2 par paquet + 5 sans paquet adapté)
-  fixtures/registry_packages.json  20 fiches de paquets connus (format register_tools)
+  fixtures/registry_packages.json  20 fiches de paquets (format register_tools)
   common.py              Configuration et outils Phoenix communs aux benchs
   fixtures/stages.json   Entrées/sorties figées de chaque étape (run de référence)
   search_cases.json      Demandes du bench et packages attendus
@@ -278,7 +278,7 @@ La recherche de packages interroge `http://localhost:8080/search` et **échoue s
 docker start searxng
 ```
 
-Plusieurs moteurs sont disponibles dans l'instance SearXNG. Le choix se fait avec `searxng_engines` dans `AgentConfig` (noms séparés par des virgules, `""` = moteurs par défaut de l'instance). **Défaut : `startpage,presearch,yandex,seznam,marginalia`** (mesuré le 18/11/2026) : ces moteurs respectent `site:pypi.org`, et comme chacun finit par être suspendu (`too many requests`), les combiner garantit qu'au moins deux répondent (11 à 16 résultats PyPI par requête sur 4 requêtes consécutives). Yahoo, ancien défaut, renvoie une `parsing error` depuis SearXNG 2026.9 ; Bing ignore `site:` ; le moteur `pypi` renvoie 0 résultat (challenge JavaScript).
+Plusieurs moteurs sont disponibles dans l'instance SearXNG. Le choix se fait avec `searxng_engines` dans `AgentConfig` (noms séparés par des virgules, `""` = moteurs par défaut de l'instance). **Défaut : `startpage,presearch,yandex,seznam,marginalia`** : ces moteurs respectent `site:pypi.org`, et comme chacun finit par être suspendu (`too many requests`), les combiner garantit qu'au moins deux répondent (11 à 16 résultats PyPI par requête sur 4 requêtes consécutives). Yahoo, ancien défaut, renvoie une `parsing error` depuis SearXNG 2026.9 ; Bing ignore `site:` ; le moteur `pypi` renvoie 0 résultat (challenge JavaScript).
 
 ⚠️ **Les moteurs de SearXNG se font bloquer** après quelques requêtes rapprochées (CAPTCHA DuckDuckGo, `too many requests` pour Brave, Startpage, Presearch, `HTTP error 403` pour Google, `access denied` pour Qwant). SearXNG renvoie alors 0 résultat **sans erreur HTTP** ; l'agent lit le tableau « Messages from the search engines » de la page et logue un `WARNING SearXNG: moteur(s) en erreur pour '<requête>': {moteur: erreur}`. Pour vérifier à la main :
 
@@ -334,7 +334,7 @@ python bench/phoenix_bench.py --label sans_prerank --set search_prerank=false
 - `--pause <s>` : pause entre deux cas, pour limiter le blocage des moteurs ;
 - les liens vers le dataset et l'expérience sont affichés en fin de run.
 
-Résultats du 07/11/2026 (8 cas, `qwen2.5:3b`, moteur Yahoo) :
+Résultats (8 cas, `qwen2.5:3b`, moteur Yahoo) :
 
 | expérience | top 3 | trouvé | MRR | temps/cas |
 |---|---|---|---|---|
@@ -413,7 +413,7 @@ La recherche SearXNG seule classe mal (MRR 0,43) : ce sont les noms proposés pa
 
 ### Bench de la sauvegarde des paquets (Phoenix)
 
-`bench/registry_bench.py` remplit le registre d'un workspace temporaire avec **20 paquets très connus** (`bench/fixtures/registry_packages.json`, fiches au format de `register_tools` : requests, yt-dlp, pillow, pandas, qrcode, pypdf, beautifulsoup4, markdown, openpyxl, gtts, httpie, matplotlib, python-docx, csvkit, black, speedtest-cli, cryptography, pyyaml, deep-translator, psutil). **Rien n'est installé** : on teste ce que le modèle fait des fiches. `bench/registry_cases.json` : 2 tâches par paquet + 5 tâches sans paquet adapté (mail SMTP, zip, OCR, SQLite, découpe vidéo).
+`bench/registry_bench.py` remplit le registre d'un workspace temporaire avec **20 paquets** (`bench/fixtures/registry_packages.json`, fiches au format de `register_tools` : requests, yt-dlp, pillow, pandas, qrcode, pypdf, beautifulsoup4, markdown, openpyxl, gtts, httpie, matplotlib, python-docx, csvkit, black, speedtest-cli, cryptography, pyyaml, deep-translator, psutil). **Rien n'est installé** : on teste ce que le modèle fait des fiches. `bench/registry_cases.json` : 2 tâches par paquet + 5 tâches sans paquet adapté (mail SMTP, zip, OCR, SQLite, découpe vidéo).
 
 | test | dataset Phoenix | ce qui est appelé | métriques |
 |---|---|---|---|
@@ -426,7 +426,7 @@ python bench/registry_bench.py --test retrieval --label seuil050 --set registry_
 python bench/registry_bench.py --test usage --label juge --judge-model qwen3.5:9b
 ```
 
-Résultats (`qwen2.5:3b`, 19/11/2026) :
+Résultats (`qwen2.5:3b`) :
 
 | run | rag_top1 | rag_top3 | selected_ok | false_positive | matcher_accepts | not_impossible | uses_package | bash_syntax | io_files |
 |---|---|---|---|---|---|---|---|---|---|
@@ -445,6 +445,7 @@ Résultats (`qwen2.5:3b`, 19/11/2026) :
 - **Console** : niveau `INFO` (modifiable avec `--log-level`).
 - **Fichier** : niveau `DEBUG` complet (prompts, README extraits, code généré, stdout/stderr complets) dans `projet_<id>/.agent/logs/run_<date>.log`, avec un lien `latest.log` vers le dernier run.
 - Chaque ligne est écrite sur disque immédiatement : **même si l'exécution est tuée (timeout, `kill -9`, crash), le log contient tout jusqu'à la dernière étape commencée.**
+- **Erreurs** : chaque erreur logue le fichier et la ligne de code en cause (traceback) et, s'il existe, le message d'erreur du terminal (stderr de la commande).
 - Chaque nœud du graphe, chaque appel LLM et chaque sous-étape d'analyse de package logue son début (`▶`), sa fin avec sa durée (`✔`) ou son échec (`✖`).
 - Signaux à chercher en cas d'échec (`grep -E "WARNING|ERROR" latest.log`) :
   - `SearXNG: moteur(s) en erreur` : moteurs bloqués ou cassés (la requête renvoie alors peu ou pas de résultats) ;
