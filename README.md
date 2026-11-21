@@ -28,6 +28,7 @@ Agent Linux autonome expérimental basé sur **LangChain**, **LangGraph** et **O
   - [3. SearXNG (obligatoire)](#3-searxng-obligatoire)
 - [Utilisation](#utilisation)
 - [Evaluation](#evaluation)
+  - [Lire les métriques](#lire-les-métriques)
   - [Bench de la recherche de packages (Phoenix)](#bench-de-la-recherche-de-packages-phoenix)
   - [Bench du RAG de documentation (Phoenix)](#bench-du-rag-de-documentation-phoenix)
   - [Bench étape par étape](#bench-étape-par-étape)
@@ -84,7 +85,9 @@ Séparer les prompts du code permet de les modifier sans toucher à Python, de l
 
 ### Exécution : commandes Linux dans un workspace par agent
 
-Le terminal Linux est l'outil universel : `curl`, `pip`, `apt`, `python3`… donnent accès à un grand nombre de programmes et de packages libres sans écrire un outil LangChain par capacité. Chaque commande a un timeout (`--timeout`), sa sortie est tronquée (`compact`, 16 000 caractères) pour ne pas saturer le contexte du LLM, et elle s'exécute dans `projet_<id>/` pour que les fichiers produits restent au même endroit. `parse_install_command` détecte les installations pour les inscrire au registre.
+Le terminal Linux est l'outil universel : `curl`, `pip`, `apt`, `python3`… donnent accès à un grand nombre de programmes et de packages libres sans écrire un outil LangChain par capacité. Chaque commande a un timeout (`--timeout`), sa sortie est tronquée (`compact`, 16 000 caractères) pour ne pas saturer le contexte du LLM, et elle s'exécute dans `projet_<id>/` pour que les fichiers produits restent au même endroit. `parse_install_command` détecte les installations pour les inscrire au registre. Elle reconnaît `sudo`/`env` en préfixe, `pip3`, `/usr/bin/pip3.12`, `python3 -m pip`, `apt-get -y install`, ainsi que les commandes enchaînées (`&&`, `;`, `|`, sauts de ligne), où seuls les mots du segment d'installation sont retenus. Les valeurs d'options comme `-r requirements.txt` ou `-i URL` ne sont pas prises pour des paquets.
+
+**Mode Docker (`--docker`, recommandé)** : les commandes s'exécutent dans un conteneur dédié au projet (`agent/sandbox.py`) au lieu de l'hôte. Au démarrage, l'agent construit l'image `agent-langchain-sandbox` depuis `docker/Dockerfile` si elle n'existe pas (Python 3.12, `curl`, `wget`, `git`, `sudo`). Il réutilise ensuite le conteneur `agent_projet_<id>_<hash>` (le redémarre ou le crée au besoin) et crée le venv `projet_<id>/.venv` s'il est absent. Le workspace est monté au même chemin dans le conteneur, donc les chemins vus par le LLM sont valables des deux côtés. Le venv est en tête du `PATH`, si bien que `pip install` fonctionne sans l'erreur `externally-managed-environment` du Python système. En plus, chaque appel à pip est réécrit par injection dans la commande (`inject_venv_pip`) : `pip`, `pip3`, `sudo pip3`, `/usr/bin/pip3.12` et `python3 -m pip` deviennent `projet_<id>/.venv/bin/python -m pip`, et les options `--user` et `--break-system-packages` sont retirées. La commande réellement exécutée est conservée dans `executed_command`. `pipx` et `pip-compile` ne sont pas touchés. Le conteneur tourne avec l'UID de l'hôte (les fichiers produits restent à l'utilisateur), et `apt`/`apt-get` passent automatiquement par `sudo`. Le réseau est celui de l'hôte (`--network host`). Le timeout est appliqué dans le conteneur (`timeout`, code `124`). Avec `--docker`, l'option `--reset` supprime aussi le conteneur et le venv.
 
 ### Persistance : checkpointer SQLite et registre JSON
 
@@ -224,7 +227,8 @@ agent/
   toolsearch.py          Recherche, analyse et installation de packages
   llm.py                 Wrapper ChatOllama + sorties structurées Pydantic
   models.py              Modèles Pydantic et AgentState
-  execution.py           Exécution des commandes shell
+  execution.py           Exécution des commandes shell (hôte ou conteneur)
+  sandbox.py             Conteneur Docker par projet + venv persistant (--docker)
   tools.py               Registre des outils générés (.agent/tools.json)
   package_registry.py    Registre des paquets vérifiés (.agent/packages.json) + recherche bge-m3
   package_advisor.py     Description LLM des paquets, paquets utilisables pour une tâche
@@ -292,6 +296,12 @@ curl -s 'http://localhost:8080/search?q=qrcode+site:pypi.org' | python3 -c "impo
 python main.py --id 1 --workspace /tmp/ev_test "telecharge une image de chien"
 ```
 
+Dans un conteneur Docker (les paquets s'installent dans `projet_<id>/.venv`) :
+
+```bash
+python main.py --id 1 --docker --workspace /tmp/ev_test "telecharge une image de chien"
+```
+
 Ou en mode interactif :
 
 ```bash
@@ -307,11 +317,13 @@ Paramètres :
 --ollama-url  URL de l'API Ollama
 --timeout     Timeout d'une commande shell (s)
 --log-level   Niveau de log console : DEBUG, INFO, WARNING, ERROR (défaut : INFO)
---reset       Supprime les outils générés avant de lancer
+--reset       Supprime les outils générés (et, avec --docker, le conteneur et le venv) avant de lancer
+--docker      Exécute les commandes dans un conteneur Docker du projet (ou AI_DOCKER=1)
+--docker-image  Image du conteneur (défaut : agent-langchain-sandbox:latest, construite depuis docker/)
 --savegraph   Sauvegarde le graphe en PNG
 ```
 
-Codes de retour : `0` succès, `1` échec de la demande, `2` argument invalide, `4` exception, `130` interruption (Ctrl+C).
+Codes de retour : `0` succès, `1` échec de la demande, `2` argument invalide, `4` exception, `5` erreur Docker, `130` interruption (Ctrl+C).
 
 ## Evaluation
 
@@ -320,6 +332,18 @@ Tous les benchs sont suivis dans [Arize Phoenix](https://github.com/Arize-ai/pho
 ```bash
 PHOENIX_WORKING_DIR=.phoenix phoenix serve   # UI sur http://localhost:6006
 ```
+
+### Lire les métriques
+
+Chaque bench lance une tâche par **cas** (une demande, un package, une tâche…) puis calcule des **métriques par cas** ; les tableaux donnent la **moyenne sur tous les cas** (ou `réussis/total`). Dans Phoenix, chaque métrique est une colonne de l'expérience, et chaque ligne garde la sortie et la trace complète du cas.
+
+- **Booléen** (`True`/`False`) : moyenne = proportion de cas réussis. `0,95` sur 40 cas = 38 cas réussis.
+- **Rang** : position (1 = premier) du premier élément attendu dans une liste classée (candidats, chunks, paquets).
+- **top N** (`hit_top3`, `rag_top1`…) : l'élément attendu est dans les N premiers. C'est ce qui compte quand l'agent n'exploite que les N premiers (3 packages analysés, 3 paquets installés proposés).
+- **trouvé** (`hit_any`, `rag_topk`) : l'élément attendu est quelque part dans la liste, quel que soit son rang.
+- **MRR** (*Mean Reciprocal Rank*) : moyenne de `1/rang` (0 si absent). 1,00 = toujours premier ; 0,50 = en moyenne deuxième ; il distingue « premier » de « troisième » là où le top N ne le fait pas.
+- **Non évaluable** : un cas où la métrique n'a pas de sens (ex. rang du bon paquet pour une tâche qui n'en a pas) est affiché `n/a` dans Phoenix et exclu de la moyenne.
+- **Bruit** : Ollama n'est pas strictement déterministe ; un écart d'un cas entre deux runs identiques n'est pas significatif.
 
 ### Bench de la recherche de packages (Phoenix)
 
@@ -334,6 +358,15 @@ python bench/phoenix_bench.py --label sans_prerank --set search_prerank=false
 - `--pause <s>` : pause entre deux cas, pour limiter le blocage des moteurs ;
 - les liens vers le dataset et l'expérience sont affichés en fin de run.
 
+Chaque cas de `search_cases.json` liste **plusieurs packages acceptables** (`expected`, ex. `pypdf`, `pdfplumber`, `pymupdf`… pour extraire le texte d'un PDF) : le cas est réussi dès que l'un d'eux sort.
+
+| métrique (colonne) | définition |
+|---|---|
+| `hit_top3` (top 3) | un package attendu est parmi les 3 premiers candidats, c'est-à-dire parmi ceux que l'agent analysera vraiment (`max_packages_analyzed`) |
+| `hit_any` (trouvé) | un package attendu est dans la liste finale des candidats, à n'importe quel rang |
+| `reciprocal_rank` (MRR) | `1/rang` du premier package attendu dans la liste finale, 0 s'il est absent |
+| `time_s` (temps/cas) | durée de `identify_required_tool` + `search_packages` pour le cas (appels LLM, SearXNG, PyPI) |
+
 Résultats (8 cas, `qwen2.5:3b`, moteur Yahoo) :
 
 | expérience | top 3 | trouvé | MRR | temps/cas |
@@ -347,6 +380,8 @@ Résultats (8 cas, `qwen2.5:3b`, moteur Yahoo) :
 | sans 5 (normalisation) | 7/8 | 8/8 | 0,84 | 7,0 s |
 | avec 7 (demande transmise) | 7/8 | 7/8 | 0,88 | 6,9 s |
 
+Les lignes « sans N » désactivent une seule étape du pipeline (numéros de la section [Flux détaillé](#flux-détaillé)) : une baisse par rapport à la configuration par défaut mesure ce que cette étape apporte.
+
 ### Bench du RAG de documentation (Phoenix)
 
 `bench/rag_bench.py` rejoue les retrievals **de production** (`extract_installation_context`, `extract_usage_context`) sur 17 docs PyPI figées (`bench/fixtures/rag/`) et vérifie que le contexte contient le passage attendu (regex de `bench/rag_cases.json`, indépendante du découpage). Chaque variante est une expérience Phoenix du dataset `agent-rag-docs` ; la sortie de chaque cas contient les contextes envoyés au LLM et le détail des retrievals (requête, rang, score, section, `via_sentence` = phrase qui a fait remonter la section). Rapport JSON dans `bench/results/rag_<label>.json`, log dans `bench/.rag_cache/logs/`.
@@ -355,6 +390,19 @@ Résultats (8 cas, `qwen2.5:3b`, moteur Yahoo) :
 python bench/rag_bench.py --variants base ml --llm-install --label base_vs_ml
 python bench/rag_bench.py --no-phoenix        # sans Phoenix
 ```
+
+Pour chaque package, `rag_cases.json` donne deux regex : la commande d'installation attendue (`install`, ex. `pip install yt-dlp`) et un exemple d'usage attendu (`usage`). Une regex ne dépend pas de la façon dont la doc est découpée, ce qui permet de comparer des découpages différents. Il y a 17 packages ; l'un n'a pas de regex d'installation, d'où les totaux sur 16.
+
+| métrique (colonne) | définition |
+|---|---|
+| `install_hit` (install dans le contexte) | la commande d'installation attendue apparaît dans le texte réellement envoyé au LLM pour l'installation |
+| `install_mrr` (MRR install) | `1/rang` du premier chunk contenant cette commande, parmi les 10 premiers chunks de la requête d'installation (0 au-delà) |
+| `usage_hit` (usage dans le contexte) | l'exemple d'usage attendu apparaît dans le contexte « usage » envoyé au LLM |
+| `usage_mrr` (MRR usage) | meilleur `1/rang` de l'exemple d'usage sur les 3 requêtes d'usage (top 10) |
+| `ctx_install` / `ctx_usage` (contexte install / usage) | taille en caractères des deux contextes : plus c'est court, plus le petit LLM s'y retrouve |
+| `install_cmd` (commande extraite par le LLM, `--llm-install`) | après `analyze_installation`, la liste `install_commands` renvoyée par le LLM contient la commande attendue ; c'est le résultat de bout en bout (retrieval + LLM) |
+
+« dans le contexte » mesure le retrieval seul, « commande extraite » mesure ce que le LLM en fait : l'écart entre les deux est la part d'échec due au LLM.
 
 | variante | install dans le contexte | MRR install | usage dans le contexte | MRR usage | contexte install / usage | commande extraite par le LLM |
 |---|---|---|---|---|---|---|
@@ -365,7 +413,7 @@ Le retrieval n'est plus le goulot : avec `ml`, la commande est toujours dans le 
 
 #### Nombre de chunks donnés au LLM (`--k`)
 
-`python bench/rag_bench.py --variants base ml --k 1 2 3 4 5 --llm-install --label topk_pypi`. k chunks pour l'installation, k chunks par requête d'usage (3 requêtes) :
+`python bench/rag_bench.py --variants base ml --k 1 2 3 4 5 --llm-install --label topk_pypi`. k = nombre de chunks gardés pour l'installation, et par requête d'usage (3 requêtes). Mêmes métriques que ci-dessus : augmenter k fait entrer plus souvent le bon passage dans le contexte, mais allonge ce contexte.
 
 | variante | install dans le contexte | usage dans le contexte | contexte install / usage | commande extraite par le LLM |
 |---|---|---|---|---|
@@ -401,6 +449,19 @@ Avant la section PyPI, `ml` k=1 était à 15/16 dans le contexte et 15/16 extrai
 | `filter` (4) | candidats normalisés | packages attendus conservés, top 3, nombre retiré |
 | `rank` (3) | candidats filtrés | top 3, MRR, plafond (attendu présent en entrée) |
 
+| métrique | définition |
+|---|---|
+| `spec_complete` (spécification complète) | la spécification d'outil a ses 4 champs non vides : `name`, `description`, `input`, `output` |
+| `n_requetes` | nombre de requêtes de recherche générées (3 visées) |
+| `requetes_courtes` | toutes les requêtes font 8 mots ou moins (une phrase entière ramène peu de résultats sur SearXNG) |
+| `requetes_distinctes` | aucune requête n'est en double (en ignorant la casse) |
+| `hit_any`, `hit_top3`, `reciprocal_rank` | comme dans le bench de recherche, sur la liste en sortie de l'étape |
+| `n_resultats` / `n_valides` / `n_sortie` | nombre de packages en sortie de l'étape ; pour `guess`, noms proposés qui existent vraiment sur PyPI |
+| `attendu_conserve` | 1 si l'étape n'a retiré **aucun** package attendu qui était présent en entrée (une étape de filtrage ne doit pas perdre la bonne réponse) |
+| `n_retires` | nombre de candidats retirés par l'étape (entrée − sortie) |
+| `plafond` | un package attendu est présent **en entrée** de l'étape : sans lui, l'étape ne peut pas réussir, un échec est alors dû aux étapes précédentes |
+| `time_s` | durée de l'étape seule |
+
 ```bash
 python bench/stage_bench.py --snapshot --label defaut     # recrée les entrées figées puis teste tout
 python bench/stage_bench.py --label essai                 # réutilise les entrées figées
@@ -415,10 +476,32 @@ La recherche SearXNG seule classe mal (MRR 0,43) : ce sont les noms proposés pa
 
 `bench/registry_bench.py` remplit le registre d'un workspace temporaire avec **20 paquets** (`bench/fixtures/registry_packages.json`, fiches au format de `register_tools` : requests, yt-dlp, pillow, pandas, qrcode, pypdf, beautifulsoup4, markdown, openpyxl, gtts, httpie, matplotlib, python-docx, csvkit, black, speedtest-cli, cryptography, pyyaml, deep-translator, psutil). **Rien n'est installé** : on teste ce que le modèle fait des fiches. `bench/registry_cases.json` : 2 tâches par paquet + 5 tâches sans paquet adapté (mail SMTP, zip, OCR, SQLite, découpe vidéo).
 
-| test | dataset Phoenix | ce qui est appelé | métriques |
-|---|---|---|---|
-| `retrieval` : le RAG retrouve-t-il le bon paquet ? | `agent-registry-retrieval` | nœud `find_installed_packages` (RAG bge-m3 + `package_matcher`) | `rag_top1`, `rag_topk`, `rag_rr` (avant LLM, tâches positives), `selected_ok` (bon paquet retenu, ou rien pour une tâche négative), `selected_precision`, `false_positive` |
-| `usage` : le modèle utilise-t-il bien le paquet ? | `agent-registry-usage` | `PackageAdvisor.match` sur le bon paquet (`--hints oracle`, ou `--hints rag`) puis nœud `prepare_task` | `matcher_accepts`, `not_impossible`, `uses_package` (commande ou fichier d'outil du paquet), `no_reinstall`, `bash_syntax`, `io_files`, `judge` (optionnel, `--judge-model`) |
+Chaque cas a un paquet attendu (`expected`) et un **marqueur** (`marker`) : la chaîne qui prouve que le paquet est utilisé dans une commande (nom de la commande CLI, ex. `yt-dlp`, `gtts-cli`, ou nom du fichier d'outil Python, ex. `resize_image.py`). On appelle **positive** une tâche qui a un paquet attendu (40 cas), et **négative** une tâche pour laquelle aucun des 20 paquets ne convient (5 cas, `expected = null`).
+
+**Test `retrieval`** (dataset `agent-registry-retrieval`, 45 cas) : le RAG retrouve-t-il le bon paquet à donner au modèle ? Il appelle le vrai nœud `find_installed_packages` : RAG bge-m3 sur le registre (3 paquets les plus proches, similarité ≥ `registry_min_score`), puis vérification LLM de chaque paquet (`package_matcher`). Le paquet est **« retrouvé »** par le RAG et **« retenu »** s'il est aussi accepté par le LLM.
+
+| métrique | cas évalués | définition |
+|---|---|---|
+| `rag_top1` | positifs | le bon paquet est le **premier** retrouvé par le RAG (avant le LLM) |
+| `rag_topk` (colonne `rag_top3`) | positifs | le bon paquet est parmi les 3 retrouvés par le RAG, donc il sera bien présenté au LLM |
+| `rag_rr` | positifs | `1/rang` du bon paquet dans la liste du RAG (MRR) |
+| `selected_ok` | tous | **la métrique principale** : positif → le bon paquet fait partie des paquets retenus ; négatif → aucun paquet n'est retenu |
+| `selected_precision` | tous | part des paquets retenus qui sont le bon paquet (1 retenu sur 2 corrects → 0,5) ; négatif : 1 si rien n'est retenu, sinon 0 |
+| `false_positive` | tous | au moins un paquet **autre** que le bon a été retenu (plus c'est bas, mieux c'est) |
+| `time_s` | tous | durée du nœud (embedding de la tâche + appels LLM en parallèle) |
+
+**Test `usage`** (dataset `agent-registry-usage`, 40 cas positifs) : le modèle utilise-t-il correctement le paquet ? Par défaut (`--hints oracle`), on donne au modèle le **bon** paquet, pour mesurer l'usage indépendamment du RAG : `PackageAdvisor.match` rédige la description et l'exemple pour la tâche, puis le vrai nœud `prepare_task` produit les commandes. Avec `--hints rag`, les indices viennent du pipeline complet (`find_installed_packages`).
+
+| métrique | définition |
+|---|---|
+| `matcher_accepts` | le LLM vérificateur (`package_matcher`) a jugé le bon paquet utilisable. S'il le refuse, l'exemple vérifié de la fiche est donné quand même, pour que la suite du test reste mesurable |
+| `not_impossible` | le plan est exécutable : `expected` n'est pas `IMPOSSIBLE` et la liste de commandes n'est pas vide. Un échec ici relance une recherche de paquet sur internet alors que le paquet est installé |
+| `uses_package` | une des commandes contient le marqueur du paquet (sa commande CLI ou le fichier de son outil) : le modèle a bien pris le paquet proposé |
+| `no_reinstall` | aucune commande `pip install` / `apt install` : le modèle a compris que le paquet est déjà installé |
+| `bash_syntax` | chaque commande passe `bash -n` (syntaxe shell valide : guillemets fermés, pas de texte libre). Une liste vide compte comme un échec |
+| `io_files` | tous les noms de fichiers de l'entrée et de la sortie de la tâche (`photo.png`, `budget.csv`…) apparaissent dans les commandes. Les cas sans fichier (ex. « moyenne affichée ») sont exclus |
+| `judge` (`--judge-model`) | un second modèle plus gros (`qwen3.5:9b`) lit la tâche, l'indice et les commandes et dit si elles réalisent la tâche. C'est la seule métrique sémantique : elle repère un argument manquant ou un chemin mal recopié, que les contrôles ci-dessus ne voient pas |
+| `time_s` | durée de la vérification LLM + `prepare_task` |
 
 ```bash
 python bench/registry_bench.py --test all --label defaut
@@ -426,7 +509,7 @@ python bench/registry_bench.py --test retrieval --label seuil050 --set registry_
 python bench/registry_bench.py --test usage --label juge --judge-model qwen3.5:9b
 ```
 
-Résultats (`qwen2.5:3b`) :
+Résultats (`qwen2.5:3b`) ; « – » = test non relancé pour ce run (les prompts du RAG n'avaient pas changé) :
 
 | run | rag_top1 | rag_top3 | selected_ok | false_positive | matcher_accepts | not_impossible | uses_package | bash_syntax | io_files |
 |---|---|---|---|---|---|---|---|---|---|
@@ -513,8 +596,8 @@ grep "terminé en" AI_Workspace/projet_1/.agent/logs/latest.log | sed -E 's/.*te
 - [ ] ajouter des vérifications utilisateurs pour l'IA
 - [ ] vérifier la conformité des demandes utilisateurs au bon fonctionnement de l'ordinateur et de l'IA
 - [ ] empêcher des attaques sur l'IA
-- [ ] isoler dans un environnement les packages installés par une IA
-- [ ] proposer un docker
+- [x] isoler dans un environnement les packages installés par une IA (venv `projet_<id>/.venv` en mode `--docker`)
+- [x] proposer un docker (`--docker`)
 
 ### Phase 4 - évaluation
 

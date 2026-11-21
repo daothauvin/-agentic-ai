@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from .sandbox import DEFAULT_IMAGE, DockerSandbox
+
 
 @dataclass(frozen=True)
 class AgentConfig:
@@ -27,6 +29,8 @@ class AgentConfig:
         registry_rank_k: Nombre maximal de paquets installés ajoutés au classement.
         max_tool_fix_attempts: Corrections (code ou commande) tentées avant d'abandonner un paquet.
         max_tool_searches_per_task: Recherches de paquet maximum pour une même tâche.
+        docker: Exécute les commandes shell dans un conteneur dédié au projet.
+        docker_image: Image du conteneur (construite depuis docker/ si c'est l'image par défaut).
     """
 
     ollama_url: str
@@ -65,9 +69,19 @@ class AgentConfig:
     registry_rank_k: int = 3
     max_tool_fix_attempts: int = 2
     max_tool_searches_per_task: int = 2
+    docker: bool = False
+    docker_image: str = DEFAULT_IMAGE
     
     @property
     def project_dir(self) -> Path:
         """Retourne le workspace dédié à cet agent."""
 
         return self.workspace_root / f"projet_{self.ai_id}"
+
+    @property
+    def sandbox(self) -> DockerSandbox | None:
+        """Retourne le bac à sable Docker du projet, ou None sans ``--docker``."""
+
+        if not self.docker:
+            return None
+        return DockerSandbox(self.project_dir, self.docker_image)

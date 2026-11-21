@@ -108,17 +108,24 @@ class AgentGraph:
     def environment(self) -> dict[str, Any]:
         """Collecte les informations système utiles à la planification."""
 
-        uname = run_command(
-            "uname -a",
-            self.config.project_dir,
-            20,
-        )
+        sandbox = self.config.sandbox
+        uname = run_command("uname -a", self.config.project_dir, 20, sandbox=sandbox)
+
+        if sandbox is not None:
+            # Python et utilisateur du conteneur, pas ceux de l'hôte.
+            python = run_command("python3 --version", self.config.project_dir, 20, sandbox=sandbox)
+            python_version = python["stdout"].split()[-1] if python["ok"] else "inconnu"
+            user = run_command("whoami", self.config.project_dir, 20, sandbox=sandbox)["stdout"].strip()
+        else:
+            python_version = sys.version.split()[0]
+            user = os.getenv("USER", "")
 
         return {
             "cwd": str(self.config.project_dir),
             "os": compact(uname["stdout"], 2000),
-            "python": sys.version.split()[0],
-            "user": os.getenv("USER", ""),
+            "python": python_version,
+            "user": user,
+            "docker": sandbox is not None,
             "ai_id": self.config.ai_id,
             "packages_and_tools": self.tools.installed_registry(),
         }
@@ -471,6 +478,7 @@ class AgentGraph:
             command,
             self.config.project_dir,
             self.config.command_timeout,
+            sandbox=self.config.sandbox,
         )
         if test_result["ok"] and not test_result["stdout"].strip():
             logger.warning("Test de l'outil sans sortie (stdout vide) : rien à vérifier")
@@ -650,6 +658,7 @@ class AgentGraph:
                 command,
                 self.config.project_dir,
                 self.config.command_timeout,
+                sandbox=self.config.sandbox,
             )
             execution.append(result)
 

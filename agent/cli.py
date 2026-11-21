@@ -8,6 +8,7 @@ from .config import AgentConfig
 from .graph import AgentGraph
 from dotenv import load_dotenv
 from .logger import get_logger, setup_logging
+from .sandbox import DEFAULT_IMAGE, SandboxError
 
 logger = get_logger("cli")
 
@@ -56,6 +57,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--docker",
+        action="store_true",
+        default=os.getenv("AI_DOCKER", "").lower() in ("1", "true", "yes"),
+        help="Exécute les commandes shell dans un conteneur Docker dédié au projet "
+             "(venv persistant <workspace>/.venv, créé au premier lancement).",
+    )
+    parser.add_argument(
+        "--docker-image",
+        default=os.getenv("AI_DOCKER_IMAGE", DEFAULT_IMAGE),
+        help="Image du conteneur (l'image par défaut est construite depuis docker/).",
+    )
+
+    parser.add_argument(
         "--log-level",
         default=os.getenv("AI_LOG_LEVEL", "INFO"),
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -93,7 +107,9 @@ def main() -> int:
         ai_id=ai_id,
         workspace_root=Path(args.workspace).expanduser().resolve(),
         command_timeout=args.timeout,
-        prompts_dir=Path(args.prompts_dir).expanduser().resolve()
+        prompts_dir=Path(args.prompts_dir).expanduser().resolve(),
+        docker=args.docker,
+        docker_image=args.docker_image,
     )
 
     log_file = setup_logging(config.project_dir / ".agent" / "logs", args.log_level)
@@ -101,6 +117,12 @@ def main() -> int:
     logger.info("Logs RAG (DEBUG) : %s", log_file.with_name(log_file.name.replace("run_", "rag_", 1)))
 
     try:
+        sandbox = config.sandbox
+        if sandbox is not None:
+            if args.reset:
+                sandbox.reset()
+            sandbox.ensure()
+
         model = AgentGraph(config)
         if args.reset:
             model.tools.reset()
@@ -135,6 +157,9 @@ def main() -> int:
 
         
         return model.run(request, checkpoint_id=args.checkpoint)
+    except SandboxError as exc:
+        logger.error("ERREUR Docker : %s", exc)
+        return 5
     except KeyboardInterrupt:
         logger.warning("Exécution interrompue par l'utilisateur.")
         return 130

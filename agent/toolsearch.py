@@ -748,6 +748,7 @@ class ToolSearchService:
                 command,
                 self.config.project_dir,
                 self.config.command_timeout,
+                sandbox=self.config.sandbox,
             )
 
             if result.get("ok"):
