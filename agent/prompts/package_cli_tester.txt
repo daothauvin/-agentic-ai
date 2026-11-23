@@ -6,7 +6,7 @@ Ta mission : proposer UNE commande shell qui utilise directement la commande du 
 RÈGLES:
 - Utilise uniquement la commande en ligne de commande du paquet décrite dans la DOCUMENTATION.
 - N'installe rien, n'écris pas de script Python.
-- Choisis un exemple d'entrée réaliste et petit (texte court, URL publique connue, fichier créé dans la même commande si nécessaire).
+- Prends d'abord les valeurs d'entrée (URL, texte, nom de fichier...) dans USER REQUEST puis dans PREVIOUS STEPS RESULTS, recopiées exactement. Sinon seulement, choisis un exemple d'entrée réaliste et petit (texte court, URL publique connue, fichier créé dans la même commande si nécessaire).
 - La commande doit être non interactive et afficher un résultat vérifiable (stdout ou `ls -l` du fichier produit).
 
 Renvoie seulement la commande shell, sans explication ni bloc de code.

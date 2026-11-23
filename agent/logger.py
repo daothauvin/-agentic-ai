@@ -89,6 +89,34 @@ def preview(value: Any, limit: int = 300) -> str:
     return text if len(text) <= limit else text[:limit] + f"… [{len(text)} car.]"
 
 
+def log_codegen(
+    logger: logging.Logger,
+    stage: str,
+    inputs: dict[str, Any],
+    outputs: dict[str, Any],
+) -> None:
+    """Logue en DEBUG l'entrée et la sortie complètes d'une génération de code.
+
+    Le bloc est délimité par des bannières ``CODEGEN <stage>`` faciles à
+    retrouver (``grep -n CODEGEN latest.log``).
+
+    Args:
+        logger: Logger à utiliser.
+        stage: Nom de l'étape (ex. ``construct_code_for_package``).
+        inputs: Entrées envoyées au LLM (prompt système, prompt utilisateur…).
+        outputs: Sorties (réponse brute, code nettoyé, chemin du fichier…).
+    """
+
+    lines = [f"===== CODEGEN {stage} — ENTRÉE ====="]
+    for key, value in inputs.items():
+        lines.append(f"--- {key} ---\n{value}")
+    lines.append(f"===== CODEGEN {stage} — SORTIE =====")
+    for key, value in outputs.items():
+        lines.append(f"--- {key} ---\n{value}")
+    lines.append(f"===== FIN CODEGEN {stage} =====")
+    logger.debug("\n".join(lines))
+
+
 @contextmanager
 def timed(label: str, logger: logging.Logger | None = None) -> Iterator[None]:
     """Chronomètre un bloc de code et logue sa durée."""

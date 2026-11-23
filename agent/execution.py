@@ -272,3 +272,91 @@ def run_command(
         logger.debug("stderr complet:\n%s", result["stderr"])
 
     return result
+
+
+# Dossiers ignorés par la détection des fichiers modifiés : caches et état
+# interne de l'agent, écrits pendant un test sans être une sortie de l'outil.
+CHANGE_PRUNE_NAMES = (".venv", "__pycache__", ".cache", ".rag", ".git", "node_modules")
+CHANGE_PRUNE_SYSTEM = ("/proc", "/sys", "/dev", "/run")
+
+
+def start_change_marker(marker: Path) -> Path:
+    """Pose le marqueur de début d'un test (fichier vide, mtime = maintenant).
+
+    Args:
+        marker: Chemin du marqueur (dans le workspace, visible du conteneur).
+
+    Returns:
+        Le chemin du marqueur.
+    """
+
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+    marker.write_bytes(b"")  # met à jour la mtime même si le fichier existait
+    return marker
+
+
+def changed_files(
+    marker: Path,
+    project_dir: Path,
+    cwd: Path,
+    sandbox: "DockerSandbox | None" = None,
+    timeout: int = 30,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Fichiers créés ou modifiés depuis le marqueur, d'après leur ctime.
+
+    La ctime (changement de l'inode) est mise à jour à chaque création,
+    écriture, renommage ou chmod, et un programme ne peut pas la régler (au
+    contraire de la mtime, que ``cp -p``, ``tar`` ou ``os.utime`` antidatent).
+    Il n'y a donc ni dossier à vider ni état « avant » à comparer, quelle
+    que soit la profondeur de l'arborescence.
+
+    Racines : avec Docker, tout le système de fichiers du conteneur
+    (``/ -xdev``) plus le workspace (monté depuis l'hôte, donc sauté par
+    ``-xdev``) ; sans Docker, le workspace seul (``/tmp`` et ``$HOME`` de
+    l'hôte sont écrits en permanence par d'autres processus). Les caches
+    (``CHANGE_PRUNE_NAMES``) et les logs de l'agent sont ignorés.
+
+    Args:
+        marker: Marqueur posé par ``start_change_marker`` avant le test.
+        project_dir: Workspace du projet.
+        cwd: Dossier courant du test (les chemins dessous sont relatifs).
+        sandbox: Conteneur du projet, ou None (hôte).
+        timeout: Délai maximal de la recherche.
+        limit: Nombre maximal de fichiers renvoyés.
+
+    Returns:
+        Liste de ``{"path", "size"}`` triée par chemin.
+    """
+
+    prune = " -o ".join(
+        [f"-name {shlex.quote(name)}" for name in CHANGE_PRUNE_NAMES]
+        + [f"-path {shlex.quote(str(project_dir / '.agent' / 'logs'))}"]
+        + [f"-path {p}" for p in CHANGE_PRUNE_SYSTEM]
+    )
+    tail = (f"\\( {prune} \\) -prune -o -type f -cnewer {shlex.quote(str(marker))} "
+            f"! -path {shlex.quote(str(marker))} -printf '%s\\t%p\\n' 2>/dev/null")
+    roots = [shlex.quote(str(project_dir))]
+    if sandbox is not None:
+        roots.insert(0, "/ -xdev")
+    command = " ; ".join(f"find {root} {tail}" for root in roots) + " ; true"
+
+    result = run_command(command, cwd, timeout, sandbox=sandbox)
+    found: dict[str, int] = {}
+    for line in result.get("stdout", "").splitlines():
+        size, _, path = line.partition("\t")
+        if path and size.isdigit():
+            found[path] = int(size)
+
+    files = []
+    for path in sorted(found):
+        try:
+            shown = str(Path(path).relative_to(cwd))
+        except ValueError:
+            shown = path
+        files.append({"path": shown, "size": found[path]})
+    if len(files) > limit:
+        logger.warning("%d fichiers modifiés pendant le test, %d gardés", len(files), limit)
+    logger.debug("Fichiers créés/modifiés depuis %s : %s", marker, files[:limit])
+    return files[:limit]

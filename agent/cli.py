@@ -29,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Modèle Ollama utilisé par LangChain.",
     )
     parser.add_argument(
+        "--code-model",
+        default=os.getenv("OLLAMA_CODE_MODEL", ""),
+        help="Modèle Ollama de l'agent de code (génération, test et correction des outils). Défaut : --model.",
+    )
+    parser.add_argument(
         "--workspace",
         default=os.getenv("AI_WORKSPACE", "AI_Workspace"),
         help="Racine des workspaces des agents.",
@@ -104,6 +109,7 @@ def main() -> int:
     config = AgentConfig(
         ollama_url=args.ollama_url,
         model=args.model,
+        code_model=args.code_model,
         ai_id=ai_id,
         workspace_root=Path(args.workspace).expanduser().resolve(),
         command_timeout=args.timeout,

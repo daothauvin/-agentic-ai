@@ -31,6 +31,9 @@ class AgentConfig:
         max_tool_searches_per_task: Recherches de paquet maximum pour une même tâche.
         docker: Exécute les commandes shell dans un conteneur dédié au projet.
         docker_image: Image du conteneur (construite depuis docker/ si c'est l'image par défaut).
+        code_model: Modèle Ollama de l'agent de code (génération, valeurs de test et
+            correction des outils Python : prompts ``tool_generator``, ``tool_tester``,
+            ``tool_fixer``). Le vérificateur reste sur ``model``. Vide = ``model``.
     """
 
     ollama_url: str
@@ -71,6 +74,7 @@ class AgentConfig:
     max_tool_searches_per_task: int = 2
     docker: bool = False
     docker_image: str = DEFAULT_IMAGE
+    code_model: str = ""
     
     @property
     def project_dir(self) -> Path:

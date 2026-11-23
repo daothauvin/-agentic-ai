@@ -24,7 +24,14 @@ class LocalLLM:
             model=config.model,
             temperature=0.,
         )
-        
+        # Agent de code : modèle dédié optionnel (``--code-model``).
+        self.code_model_name = config.code_model or config.model
+        self.code_model = (
+            ChatOllama(base_url=config.ollama_url, model=config.code_model, temperature=0.)
+            if config.code_model and config.code_model != config.model
+            else self.model
+        )
+
 
     def structured(
         self,
@@ -51,6 +58,44 @@ class LocalLLM:
             return result
 
         return schema.model_validate(result)
+
+    def text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        label: str = "texte",
+        code: bool = False,
+    ) -> str:
+        """Exécute le LLM sans schéma et renvoie sa réponse brute.
+
+        Utilisé pour la génération de code : avec le décodage JSON contraint,
+        ``qwen2.5:3b`` produit du code tronqué ou invalide (préfixe ``->``,
+        imports oubliés), alors qu'en texte libre le même prompt donne un
+        script complet.
+
+        Args:
+            system_prompt: Prompt système.
+            user_prompt: Prompt utilisateur.
+            label: Nom de l'appel dans les logs de chronométrage.
+            code: Utilise le modèle de l'agent de code (``code_model``).
+
+        Returns:
+            Contenu texte de la réponse.
+        """
+
+        model = self.code_model if code else self.model
+        logger.debug(
+            "LLM %s (%s) | system=%d car. | user=%d car.",
+            label, model.model, len(system_prompt), len(user_prompt),
+        )
+        with timed(f"LLM {label}", logger):
+            result = model.invoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt),
+                ]
+            )
+        return str(result.content)
 
     def structured_batch(
         self,

@@ -33,6 +33,7 @@ Agent Linux autonome expérimental basé sur **LangChain**, **LangGraph** et **O
   - [Bench du RAG de documentation (Phoenix)](#bench-du-rag-de-documentation-phoenix)
   - [Bench étape par étape](#bench-étape-par-étape)
   - [Bench de la sauvegarde des paquets (Phoenix)](#bench-de-la-sauvegarde-des-paquets-phoenix)
+  - [Bench de l'agent de code](#bench-de-lagent-de-code)
 - [Logs et suivi des performances](#logs-et-suivi-des-performances)
 - [Roadmap](#roadmap)
 - [Références](#références)
@@ -78,6 +79,8 @@ C'est une architecture **plan-and-execute** avec un **vérificateur séparé** e
 ### Sorties structurées Pydantic partout
 
 Chaque appel LLM renvoie un objet Pydantic (`PlanOutput`, `EvaluationOutput`, `PackageInstall`…). `langchain-ollama` utilise par défaut la méthode `json_schema`, c'est-à-dire le **décodage contraint** d'Ollama : le modèle ne peut produire que du JSON conforme au schéma. C'est ce qui rend un 3B utilisable dans un harness (aucune erreur de parsing observée). Les routes lisent des booléens (`success`, `resolvable`, `utility`…) au lieu d'analyser du texte.
+
+**Exception : la génération de code.** Avec le décodage JSON contraint (`CodeOutput`), `qwen2.5:3b` écrit du code invalide (préfixe `->` en ligne 1, lignes et imports oubliés) alors que le même prompt en texte libre donne un script complet. Le générateur (`tool_generator`), le testeur (`tool_tester`) et le correcteur (`tool_fixer`) répondent donc en texte (`LocalLLM.text`), et le code est extrait du premier bloc ```` ``` ```` (`strip_code_fences`). La doc du paquet leur est passée en texte brut, et non en chaîne JSON aux `\n` échappés.
 
 ### Prompts dans des fichiers `.txt`
 
@@ -208,9 +211,9 @@ graph TD
    - `analysis_package` : JSON PyPI → chunks Markdown → index FAISS (bge-m3, mis en cache dans `projet_<id>/.rag/<nom>-<version>/`) → retrieval des passages installation/usage → analyse LLM (`PackageInstall`, `PackageUse`) ;
    - `record_eligible_package` : rejette les packages payants, à clé d'API, non installables ou inutilisables ;
    - `install_package` : exécute les commandes d'installation proposées et choisit le mode de vérification : `cli` si le paquet s'utilise en ligne de commande, sinon `python` ;
-   - mode `python` : `construct_code_for_package` génère un outil Python, `execute_code_for_package` le lance (`python3 FICHIER ARGS`, prompt `tool_tester`) ;
+   - mode `python` : `construct_code_for_package` génère un outil Python (prompt `tool_generator`, sortie texte). `execute_code_for_package` le lance : les arguments positionnels argparse sont extraits du code avec `ast` (`positional_arguments`), le LLM (prompt `tool_tester`) donne **seulement une valeur par argument**, en recevant aussi la demande de l'utilisateur, la tâche en cours et le stdout des étapes dont elle dépend (`_test_context`, 1 500 caractères max. par étape) pour y reprendre de vraies valeurs (URL, texte…), et la commande `python3 <chemin> <valeurs>` est construite par le code (un 3B recopiait mal le chemin et le nombre d'arguments). Sans argument, le LLM n'est pas appelé. Le test tourne dans `projet_<id>/.agent/tool_test/` (à part des sorties de la vraie tâche), **sans vider le dossier** : les fichiers produits sont détectés par leur **ctime** (`changed_files` dans `agent/execution.py`). Un marqueur est posé juste avant le test, puis `find -cnewer <marqueur>` liste tout fichier créé, écrit, renommé ou chmodé après lui. La ctime ne peut pas être réglée par un programme, au contraire de la mtime que `cp -p`, `tar` ou `os.utime` antidatent. Ce fonctionnement couvre les arborescences profondes, les fichiers existants écrasés et les écritures hors du dossier courant ; un fichier laissé par un test précédent et non réécrit n'est pas compté. Racines du scan : avec `--docker`, tout le conteneur (`/ -xdev`, ~0,7 s) plus le workspace monté ; sans Docker, le workspace seul (`/tmp` et `$HOME` de l'hôte sont écrits en permanence par d'autres processus, donc une écriture hors du workspace n'y est pas vue). Les caches (`.venv`, `__pycache__`, `.cache`, `.rag`, `.git`, `node_modules`) et les logs de l'agent sont ignorés ;
    - mode `cli` (**sans code**) : `execute_code_for_package` utilise directement la commande du paquet (prompt `package_cli_tester`, à partir de la doc) ;
-   - `verify_code_package` : le LLM vérifie le résultat (prompts `tool_verifier` / `cli_verifier`) ; une commande en échec (code retour ≠ 0) n'est jamais validée. En cas d'échec, le code ou la commande corrigés sont rejoués (`max_tool_fix_attempts = 2`), puis le paquet est abandonné pour le candidat suivant ;
+   - `verify_code_package` : le LLM vérifie le résultat (prompts `tool_verifier` / `cli_verifier`), en recevant aussi la liste des fichiers produits par le test (nom et taille) ; une commande en échec (code retour ≠ 0) n'est jamais validée. En mode `python`, le vérificateur ne fait que juger : en cas d'échec, le script corrigé est écrit par un appel séparé en texte libre (`_fix_tool_code`, prompt `tool_fixer`) ; en mode `cli`, la commande corrigée vient du vérificateur. La correction est rejouée (`max_tool_fix_attempts = 2`), puis le paquet est abandonné pour le candidat suivant ;
    - `register_tools` : sauvegarde le paquet vérifié dans `.agent/packages.json` (fiche complète + description LLM), l'outil Python dans `.agent/tools/` et `.agent/tools.json`, puis retourne à `find_installed_packages`, qui retrouve le paquet pour la tâche.
 7. **`execute_commands`** — exécute les commandes dans le workspace et conserve stdout, stderr, code retour et durée.
 8. **`evaluate`** — le LLM vérifie que la tâche a réellement produit le résultat attendu.
@@ -238,6 +241,9 @@ agent/
   prompts/*.txt          Prompts de chaque rôle (planner, evaluator, package_queries, ...)
 bench/
   phoenix_bench.py       Bench de la recherche de packages dans Arize Phoenix (top 3, rappel, MRR, temps)
+  codegen_bench.py       Bench de l'agent de code (génération → test → vérification → correction)
+  codegen_prompts/       Versions des prompts de code comparées par codegen_bench.py
+  changed_files_check.py Vérifie la détection des fichiers produits par un test (ctime), Docker et hôte
   stage_bench.py         Bench étape par étape (entrées figées), suivi dans Phoenix
   rag_bench.py           Bench du RAG (sections vs multi-niveau), suivi dans Phoenix
   registry_bench.py      Bench de la sauvegarde des paquets (RAG du registre + usage), Phoenix
@@ -271,7 +277,7 @@ ollama pull qwen2.5:3b
 ollama pull bge-m3
 ```
 
-Un autre modèle peut être choisi avec `--model` ou `export OLLAMA_MODEL=...`.
+Un autre modèle peut être choisi avec `--model` ou `export OLLAMA_MODEL=...`. L'**agent de code** (génération, valeurs de test et correction des outils Python : `tool_generator`, `tool_tester`, `tool_fixer`) peut utiliser un modèle à part avec `--code-model` ou `export OLLAMA_CODE_MODEL=...` ; le vérificateur reste sur `--model`.
 Le modèle d'embedding `bge-m3` est en dur (`EMBED_MODEL` dans `agent/rag.py`) et doit être installé, sinon l'analyse des packages échoue.
 
 ### 3. SearXNG (obligatoire)
@@ -313,6 +319,7 @@ Paramètres :
 ```text
 --id          Identifiant de l'IA / workspace (projet_<id>)
 --model       Modèle Ollama (défaut : qwen2.5:3b)
+--code-model  Modèle de l'agent de code : génération, test et correction des outils (défaut : --model)
 --workspace   Racine des workspaces (défaut : AI_Workspace)
 --ollama-url  URL de l'API Ollama
 --timeout     Timeout d'une commande shell (s)
@@ -523,6 +530,62 @@ Résultats (`qwen2.5:3b`) ; « – » = test non relancé pour ce run (les promp
 - Prompts initiaux : le planificateur 3B recevait le bon exemple mais rendait `commands=[]` (6 cas) ; après l'ajout de la section SORTIE, il écrivait la bonne commande **et** `IMPOSSIBLE` (8 cas), corrigé par la règle explicite.
 - Juge `qwen3.5:9b` : **35/40 (0,875)** plans jugés corrects. Erreurs réelles du 3B : chemin de l'outil mal recopié (`extract_links.py`), argument de sortie oublié (`xlsx_to_csv.py`), argument en trop (`translate.py ... en anglais`, `resize_image.py` avec une taille non demandée) ; un rejet est une erreur du juge (yt-dlp `-o audio.mp3`).
 
+### Bench de l'agent de code
+
+`bench/codegen_bench.py` rejoue les vrais nœuds `construct_code_for_package` → `execute_code_for_package` → `verify_code_package` (corrections comprises) sur **8 paquets** : py3-wget (même spec et même doc que le run « telecharge une image de chat »), requests, httpx, qrcode, segno, markdown, mistune, markdown2. La doc vient du RAG de production sur les docs PyPI figées (`bench/fixtures/rag/`). Les paquets sont installés dans le venv du conteneur (`--docker` obligatoire). Chaque version de prompts est un dossier de `bench/codegen_prompts/`, qui ne contient que les prompts de code qu'elle change ; les autres viennent de `agent/prompts`. Résultats JSONL dans `bench/results/codegen_*.jsonl` (avec le premier script généré).
+
+```bash
+python bench/codegen_bench.py --workspace ~/.cache/ev_codegen_bench --models qwen2.5:3b --prompts P0_original P7d_noexample
+```
+
+Les métriques ne dépendent pas du vérificateur LLM :
+
+| métrique | définition |
+|---|---|
+| 1er script OK | le premier script, lancé avec des arguments **fixés** (sans le testeur), finit avec le code 0 et produit un fichier non vide (ou un stdout non vide si la tâche n'écrit pas de fichier) : mesure le générateur seul |
+| boucle OK | en fin de boucle (testeur, vérificateur et correcteur réels), le vérificateur a validé **et** le dernier test réussit vraiment |
+| faux positifs | le vérificateur a validé un test raté |
+| tests joués | nombre moyen de tests avant validation ou abandon (1 = validé du premier coup, 3 = maximum) |
+| détection | à chaque test, les fichiers réellement écrits figurent parmi ceux détectés par l'agent (`changed_files`). Pour cette vérité terrain, le bench, et lui seul, vide le dossier de test avant chaque test |
+
+Résultats (`qwen2.5:3b` pour tout l'agent, sortie texte et doc brute pour toutes les versions) :
+
+| prompts | exemples dans le prompt | 1er script OK | boucle OK | faux positifs | tests joués |
+|---|---|---|---|---|---|
+| `P0_original` (prompts d'origine) | non | 8/8 | 1/8 | 0 | 2,9 |
+| `P1_rules` (générateur : règles) | non | 3/8 | 5/8 | 0 | 2,5 |
+| `P4_fewshot` (exemple de script + URL d'exemple) | **oui** | 7/8 | 8/8 | 0 | 1,1 |
+| `P7_noexample` (règles, aucun exemple) | non | 8/8 | 2/8 | 0 | 2,5 |
+| `P7b` (+ règles par type de valeur de test) | non | 8/8 | 4/8 | 0 | 2,2 |
+| `P7c` (+ testeur : « FICHIER » retiré du prompt) | non | 8/8 | 5/8 | 0 | 1,9 |
+| `P7d` (+ vérificateur : fichier ou résultat affiché) (**défaut**) | non | 8/8 | 6/8 | 0 | 1,5 |
+
+- Avec la sortie texte, le générateur n'est plus le point faible : même les prompts d'origine donnent 8/8 scripts corrects (0/2 sur le run réel avec la sortie JSON). `P1_rules` oublie `import sys` (5 cas).
+- Les échecs de boucle viennent du **testeur** : sans exemple, le 3B invente des valeurs (URL sans `https://`, URL inventée, nom de fichier à la place d'un texte Markdown, mot `FICHIER` recopié du prompt) ; et du **vérificateur**, qui lisait « aucun fichier produit » comme un échec pour une tâche qui affiche son résultat (corrigé dans `P7d`).
+- `P7d` échoue encore sur requests et httpx : le testeur ne connaît pas d'URL d'image fiable. `P4_fewshot` fait 8/8 grâce à son URL d'exemple, mais elle est écrite pour ces cas : les prompts par défaut n'ont aucun exemple.
+- Aucun faux positif : le vérificateur ne valide jamais un test raté (la règle « code retour ≠ 0 ⇒ refusé » s'applique aussi dans le code).
+
+**Contexte du testeur.** Chaque cas a une demande utilisateur et parfois une étape précédente simulée (`CONTEXTS` dans le bench : URL dans la demande, URL dans un JSON de recherche, texte à encoder…, plus un cas témoin sans valeur). `--no-context` retire ce contexte. `valeur reprise` : la première commande de test contient la valeur fournie (7 cas, le témoin est exclu).
+
+| prompts | contexte | boucle OK | faux positifs | tests joués | valeur reprise |
+|---|---|---|---|---|---|
+| `P7d_noexample` | non | 5/8 | 0 | 1,8 | – |
+| `P7d_noexample` (**défaut**) | **oui** | **8/8** | 0 | **1,0** | 6/7 |
+| `P8_context` (testeur : « cherche d'abord dans la demande ») | oui | 8/8 | 0 | 1,0 | 6/7 |
+
+- Avec le contexte, tous les outils sont validés du premier test : le testeur reprend l'URL de la demande ou de l'étape précédente au lieu d'en inventer une.
+- `P8_context` n'apporte rien et recopie trop : `Crée un QR code pour le texte Wifi maison 1234` au lieu de `Wifi maison 1234`. Le prompt par défaut reste `P7d` ; seul le contexte est ajouté (dans le code).
+- Le cas markdown reprend `Rapport mensuel` sans le `#` du titre (compté non repris, mais le test réussit).
+- Sans contexte, le même run donne 5/8 (6/8 au run précédent) : un écart d'un cas est du bruit.
+
+**Détection par ctime (sans vider le dossier de test)**, `P7d` + contexte : boucle 7/8, 0 faux positif, détection 8/8. Le cas raté (mistune) n'est pas dû à la détection (aucun fichier attendu, aucun détecté) : le vérificateur 3B refuse trois fois un stdout HTML correct, alors qu'il l'acceptait au run précédent (bruit du vérificateur).
+
+`bench/changed_files_check.py` vérifie la détection seule, avec et sans Docker, sur un faux outil qui crée un fichier à 4 niveaux de profondeur, écrase un fichier existant, écrit hors du dossier courant (et dans `/tmp` du conteneur), remet une mtime à 1970 (`os.utime`), copie la mtime d'un vieux fichier (`touch -r`) et écrit dans `__pycache__` (doit être ignoré). Il relance ensuite un test sans vider le dossier : seul le fichier réécrit doit être compté. Résultat : 4/4.
+
+```bash
+python bench/changed_files_check.py --workspace ~/.cache/ev_changed_files
+```
+
 ## Logs et suivi des performances
 
 - **Console** : niveau `INFO` (modifiable avec `--log-level`).
@@ -539,6 +602,7 @@ Résultats (`qwen2.5:3b`) ; « – » = test non relancé pour ce run (les promp
   - `Paquet abandonné après N tentative(s)` / `Vérificateur positif mais commande en échec` : paquet non sauvegardé ;
   - `Paquets installés proches de la tâche` / `Paquet X (score s) utilisable=...` (INFO) : RAG du registre et décision du LLM, `Registre — scores` en DEBUG ;
   - `Tâche ... toujours IMPOSSIBLE après N recherche(s)` : arrêt au lieu de boucler search → register → prepare.
+- **Génération de code** (`DEBUG`, fichier `run_<date>.log`) : chaque appel LLM qui produit du code ou une commande est encadré par `===== CODEGEN <étape> — ENTRÉE =====` (prompt système et prompt utilisateur complets) puis `— SORTIE =====` (réponse brute du LLM, code/commande après nettoyage des blocs ```` ``` ````, fichier écrit) et `===== FIN CODEGEN <étape> =====`. Étapes concernées : `construct_code_for_package` (outil Python), `execute_code_for_package (python|cli)` (valeurs de test et commande), `verify_code_package (python|cli)` (verdict, et commande corrigée en mode `cli`) et `fix_tool_code` (script corrigé). Le résultat de la commande de test suit (`RÉSULTAT DU TEST`, stdout/stderr complets), puis les fichiers créés ou modifiés par le test (`Fichiers produits par le test`, et la commande `find` en `INFO`). Le modèle utilisé est indiqué à chaque appel (`LLM tool_generator (qwen2.5:3b)`). Pour les extraire : `grep -n CODEGEN latest.log`.
 - **Fichier RAG** : `projet_<id>/.agent/logs/rag_<date>.log` (lien `latest_rag.log`) ne contient que les logs `agent.rag`, en `DEBUG` :
   - taille du document (métadonnées / README), avec un avertissement si le README fait moins de 200 caractères ;
   - chunking : nombre de chunks, tailles min/moy/médiane/max, puis chaque chunk (`#id [section] taille : aperçu`), signalé `⚠ très court` (< 50 car.) ou `⚠ > max_chars` ;

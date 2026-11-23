@@ -1,5 +1,6 @@
 """Construction du graphe LangGraph et logique des nœuds."""
 
+import ast
 import json
 import os
 import shutil
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from langgraph.graph import END, START, StateGraph
 from .config import AgentConfig
-from .execution import compact, run_command
+from .execution import changed_files, compact, run_command, start_change_marker
 from .toolsearch import ToolSearchService, pypi_name_from_url
 from .package_registry import PackageRecord, PackageRegistry, VerifiedUsage
 from .package_advisor import PackageAdvisor
@@ -26,11 +27,10 @@ from .models import (
     ResolutionOutput,
     TaskPlanOutput,
     ToolEvaluationOutput,
-    CodeOutput
 )
 from .prompts import PromptLoader
 from .tools import ToolManager
-from .logger import get_logger, preview, timed_node
+from .logger import get_logger, log_codegen, preview, timed_node
 
 logger = get_logger("graph")
 
@@ -412,21 +412,21 @@ class AgentGraph:
         analysed_package = state["current_packages"][0]
         tool_spec = state["current_tool"]
         system_prompt = self.prompts.load("tool_generator")
-        logger.debug("SYS PROMPT:\n%s", system_prompt)
-
+        # Doc en texte brut (pas json.dumps : les \n échappés gênent un 3B) et
+        # réponse en texte libre (le JSON contraint casse le code généré).
         user_prompt = (
-            f"TASK: \n {json.dumps(tool_spec, ensure_ascii=False, indent=2)} \n\n"
-            f" PACKAGE: \n {json.dumps(analysed_package.usage_context, ensure_ascii=False, indent=2)}"
+            f"TASK:\n{json.dumps(tool_spec, ensure_ascii=False, indent=2)}\n\n"
+            f"PACKAGE DOCUMENTATION:\n{analysed_package.usage_context}"
         )
-        logger.debug("USER PROMPT:\n%s", user_prompt)
-        result = self.llm.structured(
-            CodeOutput,
-            system_prompt,
-            user_prompt,
-        )
-        code = strip_code_fences(result.code)
-        logger.debug("CODE:\n%s", code)
+        raw = self.llm.text(system_prompt, user_prompt, "tool_generator", code=True)
+        code = strip_code_fences(raw)
         path = self._tool_path(tool_spec)
+        log_codegen(
+            logger, "construct_code_for_package",
+            {"package": analysed_package.url, "system_prompt": system_prompt,
+             "user_prompt": user_prompt},
+            {"raw": raw, "code": code, "file": path},
+        )
         path.write_text(code, encoding="utf-8")
         logger.info("Outil écrit: %s", path)
         return {"tool_mode": "python", "tool_attempts": 0, "tool_command": None, "execution": []}
@@ -455,33 +455,86 @@ class AgentGraph:
             command = state.get("tool_command")
             if not command:
                 name = pypi_name_from_url(package.url) or package.title
-                result = self.llm.model.invoke([
-                    self.prompts.load("package_cli_tester"),
+                system_prompt = self.prompts.load("package_cli_tester")
+                user_prompt = (
                     f"PACKAGE: {name}\n"
                     f"SPEC: {json.dumps(tool_spec, ensure_ascii=False, indent=2)}\n"
-                    f"DOCUMENTATION:\n{package.usage_context}",
-                ])
+                    f"{self._test_context(state)}\n\n"
+                    f"DOCUMENTATION:\n{package.usage_context}"
+                )
+                result = self.llm.model.invoke([system_prompt, user_prompt])
                 command = strip_code_fences(result.content)
+                log_codegen(
+                    logger, "execute_code_for_package (cli)",
+                    {"system_prompt": system_prompt, "user_prompt": user_prompt},
+                    {"raw": result.content, "command": command},
+                )
+            else:
+                logger.debug("Commande CLI corrigée rejouée: %s", command)
         else:
             path = self._tool_path(tool_spec)
             code = path.read_text(encoding="utf-8")
-            logger.debug("TOOL FILE: %s\nCODE:\n%s", path, code)
-            result = self.llm.model.invoke([
-                self.prompts.load("tool_tester"),
-                f"TOOL: \n - SPEC: {json.dumps(tool_spec, ensure_ascii=False, indent=2)}\n"
-                f" - FILE: \n {path} \n - CODE: \n {code}",
-            ])
-            command = strip_code_fences(result.content)
+            system_prompt = self.prompts.load("tool_tester")
+            names = positional_arguments(code)
+            if names == []:
+                # Aucun argument obligatoire : rien à demander au LLM.
+                arguments = ""
+                logger.debug("Outil sans argument positionnel : test sans argument")
+            else:
+                if names is None:
+                    # Code illisible par ast : le LLM lit le code lui-même.
+                    wanted = f"CODE:\n{code}"
+                else:
+                    wanted = "ARGUMENTS:\n" + "\n".join(
+                        f"{i}. {name}" for i, name in enumerate(names, 1)
+                    )
+                user_prompt = (
+                    f"SPEC:\n{json.dumps(tool_spec, ensure_ascii=False, indent=2)}\n\n"
+                    f"{self._test_context(state)}\n\n{wanted}"
+                )
+                # Testeur = agent de code (modèle ``code_model``).
+                result = self.llm.code_model.invoke([system_prompt, user_prompt])
+                # Le LLM ne donne que les arguments : le chemin du fichier est
+                # connu, on construit la commande nous-mêmes (un 3B le recopie mal).
+                arguments = strip_test_arguments(strip_code_fences(result.content))
+                log_codegen(
+                    logger, "execute_code_for_package (python)",
+                    {"system_prompt": system_prompt, "user_prompt": user_prompt},
+                    {"raw": result.content, "arguments": arguments},
+                )
+            command = f"python3 {shlex_quote(str(path))} {arguments}".strip()
 
         logger.info("Commande de test proposée (%s): %s", mode, command)
+        # Le test tourne dans un dossier à part (ses fichiers ne se mélangent pas
+        # aux sorties de la vraie tâche), sans le vider : les fichiers produits
+        # sont ceux dont la ctime est postérieure au marqueur posé juste avant.
+        test_dir = self.config.project_dir / ".agent" / "tool_test"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        marker = start_change_marker(self.config.project_dir / ".agent" / "tool_test.marker")
         test_result = run_command(
             command,
-            self.config.project_dir,
+            test_dir,
             self.config.command_timeout,
             sandbox=self.config.sandbox,
         )
+        logger.debug(
+            "RÉSULTAT DU TEST: ok=%s code=%s\n--- stdout ---\n%s\n--- stderr ---\n%s",
+            test_result.get("ok"), test_result.get("returncode"),
+            test_result.get("stdout"), test_result.get("stderr"),
+        )
         if test_result["ok"] and not test_result["stdout"].strip():
             logger.warning("Test de l'outil sans sortie (stdout vide) : rien à vérifier")
+
+        # Fichiers créés ou modifiés par le test, où qu'ils soient : un fait que
+        # le vérificateur ne peut pas deviner depuis stdout (« test.jpg » affiché
+        # ≠ fichier écrit). Un fichier laissé par un test précédent et non
+        # réécrit n'y figure pas.
+        test_result["produced_files"] = [
+            f"{f['path']} ({f['size']} octets)"
+            for f in changed_files(marker, self.config.project_dir, test_dir,
+                                   sandbox=self.config.sandbox)
+        ]
+        logger.debug("Fichiers produits par le test: %s", test_result["produced_files"])
 
         # On conserve le résultat de la commande (stdout/stderr), pas la réponse du LLM.
         execution = list(state.get("execution", []))
@@ -516,16 +569,27 @@ class AgentGraph:
         else:
             system_prompt = self.prompts.load("tool_verifier")
             tried = f"TOOL CODE: \n {self._tool_path(tool_spec).read_text(encoding='utf-8')}"
+        produced = execution.get("produced_files")
         user_prompt = (
-            f"PACKAGE USAGE: {json.dumps(analysed_package.usage_context, ensure_ascii=False, indent=2)} \n"
-            f" TASK: {json.dumps(tool_spec, ensure_ascii=False, indent=2)} \n"
-            f" {tried} \n EXAMPLE RESULT: \n {execution}"
+            f"PACKAGE USAGE:\n{analysed_package.usage_context}\n\n"
+            f"TASK:\n{json.dumps(tool_spec, ensure_ascii=False, indent=2)}\n\n"
+            f"{tried}\n\n"
+            f"TEST RESULT:\n"
+            f"- command: {execution.get('command')}\n"
+            f"- return code: {execution.get('returncode')}\n"
+            f"- stdout:\n{execution.get('stdout')}\n"
+            f"- stderr:\n{execution.get('stderr')}\n"
+            f"- produced files: {', '.join(produced) if produced else 'aucun'}"
         )
-        logger.debug("USER PROMPT:\n%s", user_prompt)
         result = self.llm.structured(
             ToolEvaluationOutput,
             system_prompt,
             user_prompt,
+        )
+        log_codegen(
+            logger, f"verify_code_package ({mode})",
+            {"system_prompt": system_prompt, "user_prompt": user_prompt},
+            {"success": result.success, "raw_fix": result.code},
         )
 
         logger.info("Vérification outil (%s): %s", mode, preview(result.model_dump()))
@@ -536,8 +600,13 @@ class AgentGraph:
                            execution.get("returncode"))
 
         attempts = int(state.get("tool_attempts") or 0) + 1
-        fix = strip_code_fences(result.code or "")
-        if attempts <= self.config.max_tool_fix_attempts and fix:
+        if attempts > self.config.max_tool_fix_attempts:
+            fix = ""
+        elif mode == "cli":
+            fix = strip_code_fences(result.code or "")
+        else:
+            fix = self._fix_tool_code(analysed_package, tool_spec, execution)
+        if fix:
             logger.info("Correction %d/%d du paquet %s", attempts,
                         self.config.max_tool_fix_attempts, analysed_package.url)
             logger.debug("Correction proposée par le vérificateur:\n%s", fix)
@@ -564,6 +633,90 @@ class AgentGraph:
             }
         logger.info("%d package(s) candidat(s) restant(s)", len(packages))
         return {"tool_success": False, "tool_retry": False, "current_packages": packages}
+
+    @staticmethod
+    def _test_context(state: AgentState, limit: int = 1500) -> str:
+        """Contexte donné au testeur pour choisir des valeurs de test réelles.
+
+        Le testeur ne connaît pas forcément une URL ou une donnée valide : on
+        lui donne la demande de l'utilisateur, la tâche en cours et le résultat
+        (stdout des commandes) des étapes dont elle dépend, où ces valeurs se
+        trouvent souvent.
+
+        Args:
+            state: État courant.
+            limit: Taille maximale du stdout gardé par étape précédente.
+
+        Returns:
+            Texte avec les sections ``USER REQUEST``, ``CURRENT TASK`` et
+            ``PREVIOUS STEPS RESULTS``.
+        """
+
+        task = state.get("current_task") or {}
+        lines = [f"USER REQUEST:\n{state.get('request') or '(aucune)'}", "",
+                 "CURRENT TASK:"]
+        for key in ("title", "input", "output"):
+            if task.get(key):
+                lines.append(f"- {key}: {task[key]}")
+        lines += ["", "PREVIOUS STEPS RESULTS:"]
+        completed = state.get("completed") or {}
+        found = False
+        for dependency in task.get("depends_on") or []:
+            done = completed.get(dependency)
+            if not done:
+                continue
+            found = True
+            dep_task = done.get("task") or {}
+            stdout = "\n".join(
+                (run.get("stdout") or "").strip() for run in done.get("execution") or []
+            ).strip()
+            if len(stdout) > limit:
+                stdout = stdout[:limit] + "\n...[tronqué]..."
+            lines.append(f"- {dep_task.get('title', dependency)} "
+                         f"(output: {dep_task.get('output', '?')}):\n{stdout or '(stdout vide)'}")
+        if not found:
+            lines.append("(aucune)")
+        return "\n".join(lines)
+
+    def _fix_tool_code(
+        self,
+        analysed_package: Any,
+        tool_spec: dict[str, Any],
+        execution: dict[str, Any],
+    ) -> str:
+        """Demande au LLM (prompt ``tool_fixer``) le script Python corrigé.
+
+        La correction est générée en texte libre, comme l'outil initial : le
+        vérificateur (sortie JSON) ne fait que juger.
+
+        Args:
+            analysed_package: Paquet en cours de vérification.
+            tool_spec: Spécification de l'outil.
+            execution: Résultat du dernier test (commande, code retour, sorties).
+
+        Returns:
+            Script corrigé, sans délimiteurs de bloc de code.
+        """
+
+        path = self._tool_path(tool_spec)
+        system_prompt = self.prompts.load("tool_fixer")
+        user_prompt = (
+            f"TASK:\n{json.dumps(tool_spec, ensure_ascii=False, indent=2)}\n\n"
+            f"PACKAGE DOCUMENTATION:\n{analysed_package.usage_context}\n\n"
+            f"CURRENT CODE ({path.name}):\n{path.read_text(encoding='utf-8')}\n\n"
+            f"TEST COMMAND:\n{execution.get('command')}\n"
+            f"RETURN CODE: {execution.get('returncode')}\n"
+            f"STDOUT:\n{execution.get('stdout')}\n"
+            f"STDERR:\n{execution.get('stderr')}"
+        )
+        raw = self.llm.text(system_prompt, user_prompt, "tool_fixer", code=True)
+        fix = strip_code_fences(raw)
+        log_codegen(
+            logger, "fix_tool_code",
+            {"system_prompt": system_prompt, "user_prompt": user_prompt},
+            {"raw": raw, "code": fix},
+        )
+        return fix
 
     def register_tools(self, state: AgentState) -> dict[str, Any]:
         """Sauvegarde le paquet vérifié (et son outil) dans le registre.
@@ -1018,6 +1171,7 @@ class AgentGraph:
         logger.info("IA           : %s", self.config.ai_id)
         logger.info("Workspace    : %s", self.config.project_dir)
         logger.info("Modèle       : %s", self.config.model)
+        logger.info("Modèle code  : %s", self.config.code_model or self.config.model)
         logger.info("Architecture : %s", architecture)
         logger.info("Demande      : %s", request)
 
@@ -1063,6 +1217,9 @@ class AgentGraph:
 def strip_code_fences(text: str) -> str:
     """Retire les blocs ```...``` qu'ajoute parfois le LLM autour d'une commande/code.
 
+    Si la réponse contient un bloc de code entouré de texte (explication
+    avant ou après), seul le premier bloc est gardé.
+
     Args:
         text: Réponse brute du LLM.
 
@@ -1071,8 +1228,56 @@ def strip_code_fences(text: str) -> str:
     """
 
     text = (text or "").strip()
-    match = re.match(r"^```[\w+-]*\n(.*?)\n?```$", text, re.S)
+    match = re.search(r"```[\w+-]*\n(.*?)\n?```", text, re.S)
     return match.group(1).strip() if match else text
+
+
+def positional_arguments(code: str) -> list[str] | None:
+    """Noms des arguments positionnels argparse d'un script Python.
+
+    Cherche les appels ``*.add_argument("nom", ...)`` dont le premier
+    argument est une chaîne qui ne commence pas par ``-``.
+
+    Args:
+        code: Code source de l'outil.
+
+    Returns:
+        Noms dans l'ordre de déclaration, ou ``None`` si le code ne se
+        parse pas.
+    """
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    names = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument" and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and not node.args[0].value.startswith("-")):
+            names.append((node.lineno, node.col_offset, node.args[0].value))
+    return [name for _, _, name in sorted(names)]
+
+
+def strip_test_arguments(text: str) -> str:
+    """Garde seulement les arguments d'une réponse du testeur d'outil.
+
+    Le prompt ``tool_tester`` demande uniquement les arguments, mais le LLM
+    renvoie parfois la commande entière (``python3 chemin/outil.py ARGS``) :
+    le préfixe ``python3 <fichier>.py`` est alors retiré.
+
+    Args:
+        text: Réponse du LLM, sans bloc de code.
+
+    Returns:
+        Arguments shell, sur une seule ligne.
+    """
+
+    line = (text or "").strip().splitlines()[0].strip() if (text or "").strip() else ""
+    match = re.match(r"^(?:python3?\s+)?(?:'[^']*\.py'|\"[^\"]*\.py\"|\S+\.py)\s*", line)
+    return line[match.end():].strip() if match else line
 
 
 def shlex_quote(value: str) -> str:
